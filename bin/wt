@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# wt — 작업 1개 = 브랜치 1개 + 워크트리 1개. 끝나면 PR(squash) → main 머지 → 정리.
+#
+#   wt start <슬러그> [--base <브랜치>]   origin/<기본 브랜치>에서 wt/<슬러그> 워크트리 생성
+#   wt finish [--title <제목>]           (워크트리 안에서) rebase → 검증 → PR → squash 머지 → 정리
+#   wt list                              워크트리·wt 브랜치 상태
+#   wt gc [--apply]                      이미 main에 반영된 워크트리·브랜치 정리(기본은 목록만)
+#   wt overlap                           (워크트리 안에서) 다른 레인과 겹치는 파일
+#   wt claim [--force]                   (워크트리 안에서) 이 세션이 이 워크트리를 맡는다(재개·인계)
+#
+# 소유 표식: start·claim이 <워크트리 git-dir>/wt-owner 에 세션 ID·claude pid를 남긴다.
+# 그 pid가 살아 있는 다른 세션이면 finish·gc가 건드리지 않고, list에 [다른 세션 사용 중]으로 보인다.
+#
+# 위치: <저장소>/../<저장소이름>.wt/<슬러그>
+# 저장소별 선택 파일(커밋해 두면 모든 워크트리에 적용):
+#   .worktreeinclude      새 워크트리로 복사할 gitignore된 파일 패턴(.env 등)
+#   .claude/wt-setup.sh   새 워크트리 준비(의존성 설치 등). WT_MAIN=메인 폴더
+#   .claude/wt-verify.sh  finish에서 rebase 뒤 실행하는 검증. 실패하면 머지 중단
+set -euo pipefail
+
+die() { printf 'wt: %s\n' "$*" >&2; exit 1; }
+say() { printf '▸ %s\n' "$*" >&2; }
+
+git_common_dir() { (cd "$(git rev-parse --git-common-dir)" && pwd -P); }
+main_root() { git worktree list --porcelain | sed -n '1s/^worktree //p'; }
+has_origin() { git remote get-url origin >/dev/null 2>&1; }
+is_github() { has_origin && git remote get-url origin | grep -q 'github\.com'; }
+
+default_branch() {
+  local b
+  if has_origin; then
+    b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    [ -n "$b" ] && { echo "${b#origin/}"; return; }
+  fi
+  for b in main master; do
+    git show-ref --verify --quiet "refs/heads/$b" && { echo "$b"; return; }
+  done
+  git symbolic-ref --quiet --short HEAD
+}
+
+in_linked_worktree() { [ "$(cd "$(git rev-parse --git-dir)" && pwd -P)" != "$(git_common_dir)" ]; }
+
+# 브랜치 내용이 이미 base에 들어가 있는가(squash 머지 포함).
+content_in_base() {
+  local base=$1 br=$2 tree
+  git merge-base --is-ancestor "$br" "$base" && return 0
+  # rebase·cherry-pick된 사본: 모든 커밋과 같은 patch-id가 base에 있다.
+  ! git cherry "$base" "$br" | grep -q '^+' && return 0
+  tree=$(git merge-tree --write-tree "$base" "$br" 2>/dev/null | head -1) || return 1
+  [ "$tree" = "$(git rev-parse "$base^{tree}")" ]
+}
+
+# ── 세션 소유 표식 ─────────────────────────────────────────────
+# 워크트리마다 <워크트리 git-dir>/wt-owner 에 "session pid 시각"을 남긴다.
+# pid는 이 명령을 부른 claude 프로세스. 살아 있으면 그 세션이 쓰는 중으로 본다.
+# 워크트리를 지우면 git-dir째 사라지므로 따로 치울 것이 없다.
+my_session() { printf '%s' "${WT_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"; }
+claude_pid() {
+  local p=$$ c
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    c=$(ps -o comm= -p "$p" 2>/dev/null) || return 0
+    [ "${c##*/}" = claude ] && { echo "$p"; return; }
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+}
+owner_file() { echo "$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)/wt-owner"; }
+write_owner() {
+  local f; f=$(owner_file "$1")
+  printf '%s %s %s\n' "$(my_session)" "${WT_CLAUDE_PID:-$(claude_pid)}" "$(date +%Y-%m-%dT%H:%M)" >"$f"
+}
+pid_alive() { [ -n "$1" ] && [ "$1" != - ] && kill -0 "$1" 2>/dev/null && [ "$(basename "$(ps -o comm= -p "$1" 2>/dev/null)")" = claude ]; }
+# 출력: mine | other <pid> <시각> | stale | none
+owner_state() {
+  local f s p t; f=$(owner_file "$1")
+  [ -f "$f" ] || { echo none; return; }
+  read -r s p t <"$f" || true
+  if [ -n "$s" ] && [ "$s" = "$(my_session)" ]; then echo mine; return; fi
+  if pid_alive "$p"; then echo "other $p $t"; else echo stale; fi
+}
+# 하네스(Agent isolation: "worktree")가 건 잠금 "claude agent … (pid N …)"의 N이 살아 있는 다른 claude면 그 세션 에이전트가 쓰는 중이다.
+agent_lock_state() {
+  local lp; lp=$(git -C "$(main_root)" worktree list --porcelain | awk -v w="worktree $1" '$0==w{f=1;next} /^worktree /{f=0} f&&/^locked/{print;exit}' | sed -nE 's/.*claude agent .*\(pid ([0-9]+).*/\1/p')
+  [ -n "$lp" ] || { echo none; return; }
+  if [ "$lp" = "${WT_CLAUDE_PID:-$(claude_pid)}" ]; then echo mine; elif pid_alive "$lp"; then echo "other $lp"; else echo stale; fi
+}
+owner_label() {
+  case $1 in
+    mine) echo " [이 세션]" ;;
+    other*) set -- $1; echo " [다른 세션 사용 중 pid $2, $3부터]" ;;
+    stale) echo " [주인 세션 종료됨]" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ── 레인 간 파일 겹침 ─────────────────────────────────────────
+# 워크트리(또는 브랜치)가 base 이후 바꾼 파일 + 미커밋 변경. union 머지 파일(기록 등)은 충돌하지 않으니 뺀다.
+lane_files() {
+  local ref=$1 w=$2 b=$3 mb
+  {
+    if [ -n "$b" ] && mb=$(git merge-base "$ref" "$b" 2>/dev/null); then git diff --name-only "$mb" "$b"; fi
+    [ -n "$w" ] && git -C "$w" status --porcelain 2>/dev/null | sed 's/^...//; s/.* -> //'
+  } | sort -u | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ "$(git check-attr merge -- "$f" | sed 's/.*: //')" = union ] && continue
+    echo "$f"
+  done
+}
+# 인자로 준 워크트리(없으면 현재 워크트리)와 다른 레인이 겹치는 파일을 보여 준다. 겹치면 1을 돌려준다.
+show_overlap() {
+  local me=$1 root ref base mine hit=0
+  root=$(main_root); base=$(default_branch)
+  ref=$base; has_origin && git show-ref --verify --quiet "refs/remotes/origin/$base" && ref="origin/$base"
+  local mybr; mybr=$(git -C "$me" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  mine=$(lane_files "$ref" "$me" "$mybr")
+  while IFS=$'\t' read -r w b; do
+    [ "$w" = "$root" ] || [ "$w" = "$me" ] && continue
+    local theirs common
+    theirs=$(lane_files "$ref" "$w" "$b")
+    [ -n "$theirs" ] || continue
+    if [ -n "$mine" ]; then
+      common=$(comm -12 <(echo "$mine") <(echo "$theirs"))
+      [ -n "$common" ] || continue
+      hit=1; printf '  겹침 %s (%s)%s\n' "$w" "$b" "$(owner_label "$(owner_state "$w")")"
+      echo "$common" | sed 's/^/      /'
+    else
+      # 아직 바꾼 게 없으면(새로 시작) 다른 레인이 쥐고 있는 파일을 알려만 준다.
+      hit=1; printf '  작업 중 %s (%s)%s\n' "$w" "$b" "$(owner_label "$(owner_state "$w")")"
+      echo "$theirs" | head -15 | sed 's/^/      /'
+      [ "$(echo "$theirs" | wc -l)" -gt 15 ] && echo "      …"
+    fi
+  done < <(git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w"\t"substr($0,19)}')
+  return $hit
+}
+
+cmd_overlap() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  in_linked_worktree || die "작업 워크트리 안에서 실행하세요"
+  local me; me=$(git rev-parse --show-toplevel)
+  if show_overlap "$me"; then say "다른 레인과 겹치는 파일 없음"; else say "위 파일은 다른 레인도 고치는 중입니다. 먼저 끝나는 쪽 뒤에 rebase 충돌이 날 수 있습니다"; fi
+}
+
+cmd_claim() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  in_linked_worktree || die "작업 워크트리 안에서 실행하세요"
+  local me st; me=$(git rev-parse --show-toplevel); st=$(owner_state "$me")
+  case $st in other*) [ "${1-}" = --force ] || die "다른 세션이 쓰는 중입니다$(owner_label "$st"). 그 세션이 끝났는지 확인 후 wt claim --force" ;; esac
+  write_owner "$me"; say "이 세션이 $me 를 맡습니다"
+}
+
+cmd_start() {
+  local slug="" base=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --base) base=$2; shift 2 ;;
+      -*) die "알 수 없는 옵션: $1" ;;
+      *) slug=$1; shift ;;
+    esac
+  done
+  [ -n "$slug" ] || die "사용법: wt start <슬러그> [--base <브랜치>]"
+  [[ $slug =~ ^[A-Za-z0-9._-]+$ ]] || die "슬러그는 영문·숫자·. _ - 만: $slug"
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  git rev-parse --verify --quiet HEAD >/dev/null || die "커밋이 없는 저장소입니다(첫 커밋은 메인 폴더에서)"
+
+  local root; root=$(main_root)
+  cd "$root"
+  [ -n "$base" ] || base=$(default_branch)
+  local branch="wt/$slug" dir; dir="$(dirname "$root")/$(basename "$root").wt/$slug"
+  git show-ref --verify --quiet "refs/heads/$branch" && die "브랜치가 이미 있습니다: $branch (wt list)"
+  [ -e "$dir" ] && die "폴더가 이미 있습니다: $dir"
+
+  local from=$base
+  if has_origin; then
+    git fetch --quiet origin "$base" && from="origin/$base"
+  fi
+  mkdir -p "$(dirname "$dir")"
+  git worktree add --quiet --no-track -b "$branch" "$dir" "$from"
+  git -C "$dir" config "branch.$branch.wtBase" "$base"
+
+  if [ -f "$root/.worktreeinclude" ]; then
+    git ls-files --others --ignored --exclude-from="$root/.worktreeinclude" --directory \
+      | while IFS= read -r f; do
+          f=${f%/}; mkdir -p "$dir/$(dirname "$f")"; cp -R "$root/$f" "$dir/$f"
+        done
+  fi
+  if [ -x "$dir/.claude/wt-setup.sh" ]; then
+    say "준비 스크립트 실행: .claude/wt-setup.sh"
+    (cd "$dir" && WT_MAIN="$root" ./.claude/wt-setup.sh) || die "준비 스크립트 실패(워크트리는 남겨 둠: $dir)"
+  fi
+  write_owner "$dir"
+  say "워크트리: $dir  (브랜치 $branch ← $from)"
+  local others
+  if ! others=$(show_overlap "$dir"); then
+    say "다른 레인이 작업 중인 파일(같은 파일을 고치면 나중에 rebase 충돌, 주제가 겹치면 그 레인에 합칠지 먼저 판단):"
+    printf '%s\n' "$others" >&2
+  fi
+  echo "$dir"
+}
+
+squash_message() {
+  local base=$1 title=$2 n
+  n=$(git rev-list --count "$base..HEAD")
+  if [ "$n" = 1 ]; then git log -1 --format=%B; return; fi
+  [ -n "$title" ] || title=$(git log --reverse --format=%s "$base..HEAD" | head -1)
+  printf '%s\n\n' "$title"
+  git log --reverse --format='* %s%n%n%b' "$base..HEAD" | grep -v '^Co-Authored-By:' | cat -s
+  git log --format='%(trailers:key=Co-Authored-By,valueonly=false)' "$base..HEAD" | sort -u | sed '/^$/d'
+}
+
+cmd_finish() {
+  local title=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --title) title=$2; shift 2 ;;
+      *) die "알 수 없는 옵션: $1" ;;
+    esac
+  done
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  in_linked_worktree || die "메인 폴더가 아니라 작업 워크트리 안에서 실행하세요"
+  local dir branch root base
+  dir=$(git rev-parse --show-toplevel)
+  branch=$(git symbolic-ref --quiet --short HEAD) || die "브랜치가 없는 상태(detached)입니다"
+  root=$(main_root)
+  base=$(git config "branch.$branch.wtBase" || default_branch)
+  [ -z "$(git status --porcelain)" ] || die "커밋하지 않은 변경이 있습니다. 먼저 커밋하세요"
+  [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ] \
+    && die "rebase가 진행 중입니다. 충돌을 풀고 git rebase --continue 후 다시 실행하세요"
+  local st; st=$(owner_state "$dir")
+  case $st in other*) [ "${WT_FORCE_FINISH:-}" = 1 ] || die "다른 세션이 쓰는 워크트리입니다$(owner_label "$st"). 그 세션에서 finish하거나, 끝난 게 확실하면 wt claim --force 후 재실행" ;; esac
+  local ov; ov=$(show_overlap "$dir") || { say "참고: 다른 레인과 겹치는 파일(그쪽이 나중에 rebase 충돌을 풀게 됩니다):"; printf '%s\n' "$ov" >&2; }
+
+  # 동시에 끝나는 작업끼리 머지를 한 줄로 세운다.
+  local lock; lock="$(git_common_dir)/wt-finish.lock"
+  local waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    [ $waited = 0 ] && say "다른 finish가 진행 중이라 기다립니다($lock)"
+    waited=$((waited + 1)); [ $waited -gt 600 ] && die "잠금 대기 10분 초과. 멈춘 잠금이면 삭제: rmdir $lock"
+    sleep 1
+  done
+  trap "rmdir '$lock' 2>/dev/null || true" EXIT
+
+  local upstream=$base
+  if has_origin; then git fetch --quiet origin "$base"; upstream="origin/$base"; fi
+
+  if [ "$(git rev-list --count "$upstream..HEAD")" = 0 ]; then
+    say "main에 새로 들어갈 커밋이 없습니다. 정리만 합니다"
+  else
+    say "rebase: $branch → $upstream"
+    git rebase --quiet "$upstream" || die "rebase 충돌. 이 워크트리($dir)에서 풀고 git rebase --continue → 검증 → wt finish 재실행"
+    if [ -x .claude/wt-verify.sh ]; then
+      say "검증 스크립트 실행: .claude/wt-verify.sh"
+      ./.claude/wt-verify.sh || die "검증 실패. 고친 뒤 커밋하고 wt finish 재실행"
+    fi
+
+    if is_github && command -v gh >/dev/null; then
+      local msg subject body pr state
+      msg=$(squash_message "$upstream" "$title")
+      subject=$(printf '%s\n' "$msg" | head -1)
+      body=$(printf '%s\n' "$msg" | tail -n +3)
+      say "push → origin/$branch"
+      git push --quiet --force-with-lease -u origin "$branch"
+      pr=$(gh pr list --head "$branch" --base "$base" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+      if [ -z "$pr" ]; then
+        gh pr create --base "$base" --head "$branch" --title "$subject" \
+          --body "$(printf '%s\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' "$body")" >/dev/null
+        pr=$(gh pr list --head "$branch" --base "$base" --state open --json number --jq '.[0].number')
+      fi
+      say "PR #$pr squash 머지"
+      gh pr merge "$pr" --squash --subject "$subject" --body "$body" \
+        || die "머지 실패(보호 규칙·체크 등). PR #$pr 을 확인하세요. 워크트리는 남겨 둠"
+      state=$(gh pr view "$pr" --json state --jq .state)
+      [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 워크트리는 남겨 둠"
+      git push --quiet origin --delete "$branch" 2>/dev/null || true
+    else
+      # 원격이 없거나 GitHub가 아닌 저장소: 로컬 squash 후 base를 fast-forward.
+      local msg; msg=$(squash_message "$upstream" "$title")
+      git reset --soft "$upstream"
+      git commit --quiet -F - <<<"$msg"
+      if has_origin; then
+        git push --quiet origin "HEAD:$base" || die "origin/$base 로 push 실패. 워크트리는 남겨 둠"
+      fi
+      local holder
+      holder=$(git worktree list --porcelain | awk -v b="refs/heads/$base" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}')
+      if [ -n "$holder" ]; then
+        git -C "$holder" merge --quiet --ff-only "$branch" || die "$holder 의 $base 를 fast-forward 못 함(그 폴더에 겹치는 미커밋 변경). 워크트리는 남겨 둠"
+      else
+        git merge-base --is-ancestor "$base" "$branch" || die "$base 가 앞서 있습니다. wt finish 재실행"
+        git branch -f "$base" "$branch"
+      fi
+    fi
+    say "머지 완료 → $base"
+  fi
+
+  cd "$root"
+  # Agent(isolation: "worktree")가 만든 워크트리는 "claude agent ..." 사유로 잠겨 있다.
+  # finish를 그 안에서 실행했다는 건 작업이 끝났다는 뜻이므로 그 잠금만 푼다(다른 사유 잠금은 그대로 실패).
+  local lock_reason
+  lock_reason=$(git worktree list --porcelain | awk -v w="worktree $dir" '$0==w{f=1;next} /^worktree /{f=0} f&&/^locked/{sub(/^locked ?/,"");print;exit}')
+  case "$lock_reason" in
+    "claude agent"*) git worktree unlock "$dir" ;;
+  esac
+  git worktree remove --force "$dir"
+  git branch -D "$branch" >/dev/null
+  rmdir "$(dirname "$dir")" 2>/dev/null || true
+  if has_origin; then
+    git fetch --quiet --prune origin
+    if [ "$(git symbolic-ref --quiet --short HEAD || true)" = "$base" ]; then
+      git merge --quiet --ff-only "origin/$base" 2>/dev/null \
+        || say "경고: 메인 폴더($root)를 origin/$base 로 fast-forward 못 했습니다(미커밋 변경 확인)"
+    fi
+  fi
+  say "정리 완료: 워크트리·브랜치 $branch 삭제, 메인 폴더 $root"
+}
+
+cmd_list() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  cd "$(main_root)"
+  local base; base=$(default_branch)
+  local ref=$base; has_origin && git show-ref --verify --quiet "refs/remotes/origin/$base" && ref="origin/$base"
+  printf '기준: %s\n' "$ref"
+  git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w"\t"substr($0,19)} /^detached/{print w"\t(detached)"}' |
+    while IFS=$'\t' read -r w b; do
+      [ "$w" = "$(main_root)" ] && continue
+      local st=""; [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ] && st=" 미커밋변경"
+      if [ "$b" = "(detached)" ]; then printf '  워크트리 %s  (detached)%s\n' "$w" "$st"; continue; fi
+      local ahead; ahead=$(git rev-list --count "$ref..$b")
+      local merged=""; content_in_base "$ref" "$b" && merged=" [main에 반영됨]"
+      local al=""; case $(agent_lock_state "$w") in other*) al=" [다른 세션 에이전트 실행 중]" ;; mine) al=" [이 세션 에이전트]" ;; esac
+      printf '  워크트리 %s  %s  +%s%s%s%s%s\n' "$w" "$b" "$ahead" "$merged" "$st" "$(owner_label "$(owner_state "$w")")" "$al"
+    done
+  git for-each-ref --format='%(refname:short)' refs/heads | while read -r b; do
+    [ "$b" = "$base" ] && continue
+    git worktree list --porcelain | grep -qx "branch refs/heads/$b" && continue
+    local merged=""; content_in_base "$ref" "$b" && merged=" [main에 반영됨]"
+    printf '  브랜치만 %s  +%s%s\n' "$b" "$(git rev-list --count "$ref..$b")" "$merged"
+  done
+}
+
+cmd_gc() {
+  local apply=0; [ "${1-}" = --apply ] && apply=1
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  local root; root=$(main_root); cd "$root"
+  has_origin && git fetch --quiet --prune origin
+  [ $apply = 1 ] && git worktree prune
+  local base; base=$(default_branch)
+  local ref=$base; has_origin && git show-ref --verify --quiet "refs/remotes/origin/$base" && ref="origin/$base"
+  local n=0
+  while IFS=$'\t' read -r w b; do
+    [ "$w" = "$root" ] && continue
+    [ -n "$b" ] || continue
+    [ -z "$(git -C "$w" status --porcelain 2>/dev/null)" ] || { printf '  유지(미커밋 변경) %s\n' "$w"; continue; }
+    case $(owner_state "$w") in other*) printf '  유지(다른 세션 사용 중) %s  %s\n' "$w" "$b"; continue ;; esac
+    case $(agent_lock_state "$w") in other*) printf '  유지(다른 세션 에이전트 잠금) %s  %s\n' "$w" "$b"; continue ;; esac
+    # 방금 만든 워크트리는 커밋이 없어도 main과 같아 보인다. 다른 세션 것일 수 있으니 하루 동안은 건드리지 않는다.
+    local gd; gd=$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null)
+    if [ -n "$gd" ] && [ -n "$(find "$gd" "$w" -maxdepth 1 -mmin -1440 2>/dev/null | head -1)" ]; then
+      printf '  유지(24시간 내 사용) %s  %s\n' "$w" "$b"; continue
+    fi
+    content_in_base "$ref" "$b" || { printf '  유지(미반영 커밋) %s  %s\n' "$w" "$b"; continue; }
+    n=$((n + 1)); printf '  정리 대상 워크트리 %s  %s\n' "$w" "$b"
+    if [ $apply = 1 ]; then git worktree remove --force "$w"; git branch -D "$b" >/dev/null; fi
+  done < <(git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w"\t"substr($0,19)}')
+  while read -r b; do
+    [ "$b" = "$base" ] && continue
+    git worktree list --porcelain | grep -qx "branch refs/heads/$b" && continue
+    content_in_base "$ref" "$b" || { printf '  유지(미반영 커밋) 브랜치 %s\n' "$b"; continue; }
+    n=$((n + 1)); printf '  정리 대상 브랜치 %s\n' "$b"
+    [ $apply = 1 ] && git branch -D "$b" >/dev/null
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+  # 마지막 워크트리를 지우면 <저장소>.wt/ 빈 폴더만 남는다(비어 있을 때만 지워짐)
+  [ $apply = 1 ] && { rmdir "$(dirname "$root")/$(basename "$root").wt" 2>/dev/null || true; }
+  if [ $apply = 1 ]; then say "${n}개 정리함"; else say "${n}개 정리 가능. 실행: wt gc --apply"; fi
+}
+
+case ${1-} in
+  start) shift; cmd_start "$@" ;;
+  finish) shift; cmd_finish "$@" ;;
+  list|ls) shift; cmd_list "$@" ;;
+  gc) shift; cmd_gc "$@" ;;
+  overlap) shift; cmd_overlap "$@" ;;
+  claim) shift; cmd_claim "$@" ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

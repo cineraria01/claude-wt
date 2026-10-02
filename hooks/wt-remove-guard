@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# PreToolUse(Bash): 다른 세션(또는 살아 있는 다른 claude)이 쓰는 워크트리를 손으로 지우는 명령을 막는다.
+# 막는 명령: git worktree unlock|remove|move, 워크트리 경로를 가리키는 rm -r.
+# 판정: 하네스 잠금 "claude agent … (pid N …)"의 N 또는 wt-owner의 pid가 살아 있는 claude이고 이 세션이 아니면 막는다.
+# 통과: wt finish / wt gc(스크립트가 스스로 판정한다), 이 세션의 워크트리, 주인이 끝난 워크트리.
+# 계기: 다른 세션의 수동 정리 반복문이 실행 중 에이전트 워크트리의 잠금을 풀고 지웠다.
+input=$(cat)
+cmd=$(printf '%s' "$input" | /usr/bin/python3 -c '
+import json,sys
+d=json.load(sys.stdin); print((d.get("tool_input") or {}).get("command") or "")' 2>/dev/null) || exit 0
+[ -n "$cmd" ] || exit 0
+printf '%s' "$cmd" | grep -Eq 'worktree[[:space:]]+(unlock|remove|move)|rm[[:space:]]+-[a-zA-Z]*[rR]' || exit 0
+
+# 이 세션의 claude pid
+me="${WT_CLAUDE_PID:-}"; p=$$; [ -n "$me" ] && p=1
+while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+  c=$(ps -o comm= -p "$p" 2>/dev/null) || break
+  [ "${c##*/}" = claude ] && { me=$p; break; }
+  p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+done
+mysess="${CLAUDE_CODE_SESSION_ID:-}"
+alive_claude() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null && [ "$(basename "$(ps -o comm= -p "$1" 2>/dev/null)")" = claude ]; }
+
+# 명령이 도는 곳(cwd)의 저장소 기준으로 워크트리 목록을 본다. 저장소가 아니면 통과.
+cwd=$(printf '%s' "$input" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd") or "")' 2>/dev/null)
+[ -d "$cwd" ] && cd "$cwd" 2>/dev/null
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+
+blocked=""
+while IFS=$'\t' read -r w lock; do
+  # 명령에 이 워크트리 경로(절대 또는 끝 이름)가 나오는 경우만 본다
+  name=$(basename "$w")
+  printf '%s' "$cmd" | grep -Fq "$name" || continue
+  who=""
+  lp=$(printf '%s' "$lock" | sed -nE 's/.*claude agent .*\(pid ([0-9]+).*/\1/p')
+  if [ -n "$lp" ] && [ "$lp" != "$me" ] && alive_claude "$lp"; then who="에이전트 잠금(세션 pid $lp)"; fi
+  of="$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null)/wt-owner"
+  if [ -z "$who" ] && [ -f "$of" ]; then
+    read -r s op t <"$of" || true
+    if [ "$s" != "$mysess" ] && [ "$op" != "$me" ] && alive_claude "$op"; then who="wt 주인 세션(pid $op, $t부터)"; fi
+  fi
+  [ -n "$who" ] && blocked="$blocked
+  - $w: $who"
+done < <(git worktree list --porcelain | awk '/^worktree /{if(w!="")print w"\t"l; w=substr($0,10); l=""} /^locked/{l=$0} END{if(w!="")print w"\t"l}')
+
+[ -n "$blocked" ] || exit 0
+reason="다른 살아 있는 세션이 쓰는 워크트리를 지우거나 잠금을 풀려고 합니다:$blocked
+커밋·변경이 없어 보여도 실행 중인 에이전트가 첫 커밋 전일 수 있습니다. 정리는 \`wt gc\`(목록) → \`wt gc --apply\`로만 하세요(살아 있는 세션 것은 건너뜁니다). 그 세션이 끝난 게 확실하면 사용자에게 확인받은 뒤 진행하세요."
+/usr/bin/python3 -c 'import json,sys; print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":sys.argv[1]}},ensure_ascii=False))' "$reason"

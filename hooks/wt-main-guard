@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# PreToolUse(Edit|Write|MultiEdit|NotebookEdit): git 저장소의 메인 폴더에서 추적 파일 편집을 막는다.
+# 통과: git 밖, 연결 워크트리 안, gitignore된 파일, 커밋 없는 저장소, `git config wt.disabled true`.
+input=$(cat)
+file=$(printf '%s' "$input" | /usr/bin/python3 -c '
+import json,sys
+d=json.load(sys.stdin); t=d.get("tool_input") or {}
+print(t.get("file_path") or t.get("notebook_path") or "")' 2>/dev/null) || exit 0
+[ -n "$file" ] || exit 0
+
+dir=$(dirname "$file")
+while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir=$(dirname "$dir"); done
+cd "$dir" 2>/dev/null || exit 0
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+[ "$(git config --bool wt.disabled 2>/dev/null)" = true ] && exit 0
+git rev-parse --verify --quiet HEAD >/dev/null || exit 0
+gd=$(cd "$(git rev-parse --git-dir)" && pwd -P)
+cd_=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+[ "$gd" != "$cd_" ] && exit 0
+git check-ignore -q "$file" 2>/dev/null && exit 0
+
+root=$(git rev-parse --show-toplevel)
+reason="메인 폴더($root)에서는 파일을 직접 고치지 않습니다(전역 워크트리 규칙). 먼저 \`~/.claude/bin/wt start <슬러그>\`로 워크트리를 만들고 EnterWorktree(path=출력 경로)로 들어가 그 안에서 편집하세요. 이 저장소만 예외로 두려면 사용자 승인 뒤 \`git config wt.disabled true\`."
+/usr/bin/python3 -c 'import json,sys; print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":sys.argv[1]}},ensure_ascii=False))' "$reason"

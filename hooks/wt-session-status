@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SessionStart: 현재 저장소에 남은 작업 워크트리·브랜치를 알려 준다. 없으면 조용히 끝낸다.
+input=$(cat)
+# 이 세션의 ID를 wt에 넘겨 [이 세션]/[다른 세션 사용 중]을 가른다.
+WT_SESSION_ID=$(printf '%s' "$input" | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("session_id",""))
+except Exception: print("")' 2>/dev/null)
+export WT_SESSION_ID
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+[ "$(git config --bool wt.disabled 2>/dev/null)" = true ] && exit 0
+out=$("$HOME/.claude/bin/wt" list 2>/dev/null | tail -n +2)
+[ -n "$out" ] || exit 0
+msg="[wt] 이 저장소에 남아 있는 작업 워크트리·브랜치([다른 세션 사용 중]은 건드리지 않는다. 이어서 쓸 내 워크트리는 그 안에서 wt claim, 정리는 wt gc):
+$out"
+/usr/bin/python3 -c 'import json,sys; print(json.dumps({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":sys.argv[1]}},ensure_ascii=False))' "$msg"
