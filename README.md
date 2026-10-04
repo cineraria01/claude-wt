@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / list / gc / overlap / claim |
 | 훅 | `~/.claude/hooks/wt-main-guard` | 메인 폴더의 추적 파일 Edit/Write 차단 |
 | 훅 | `~/.claude/hooks/wt-remove-guard` | 다른 살아 있는 세션의 워크트리 삭제·잠금 해제 차단 |
-| 훅 | `~/.claude/hooks/wt-session-status` | 세션 시작 때 남은 워크트리 알림 |
+| 훅 | `~/.claude/hooks/wt-session-status` | 세션 시작 때 반영된 워크트리 자동 정리 + 남은 워크트리 알림 |
 | 저장소 파일(선택) | `.claude/wt-setup.sh` | 새 워크트리 준비(의존성 설치 등) |
 | 저장소 파일(선택) | `.claude/wt-verify.sh` | finish 때 rebase 뒤 검증 |
 | 저장소 파일(선택) | `.worktreeinclude` | 새 워크트리로 복사할 gitignore 파일(예 `.env`) |
@@ -80,7 +80,7 @@ squash 커밋 메시지: 커밋이 1개면 그 메시지 그대로, 여러 개�
 |---|---|---|
 | `wt-main-guard` | PreToolUse `Edit\|Write\|MultiEdit\|NotebookEdit` | 메인 폴더의 추적 파일 편집을 거부. 통과: git 밖, 연결 워크트리 안, gitignore된 파일, 커밋 없는 저장소, `git config wt.disabled true` |
 | `wt-remove-guard` | PreToolUse `Bash` | `git worktree unlock\|remove\|move`나 워크트리 경로를 가리키는 `rm -r`이 다른 살아 있는 세션(에이전트 잠금 pid 또는 `wt-owner` pid)의 워크트리를 겨누면 거부. `wt finish`/`wt gc`는 스스로 판정하므로 통과 |
-| `wt-session-status` | SessionStart `startup`·`resume`·`clear`·`compact` | `wt list` 결과가 있으면 "[wt] 남아 있는 작업 워크트리·브랜치"로 알려 준다 |
+| `wt-session-status` | SessionStart `startup`·`resume`·`clear`·`compact` | `wt gc --apply`로 기본 브랜치에 반영된 워크트리·브랜치를 정리하고, 남은 `wt list` 결과(`[wt 관리 밖]` 제외)를 "[wt] 남아 있는 작업 워크트리·브랜치"로 알려 준다. `[오래됨]`은 사용자에게 정리 여부를 묻는다 |
 
 - `wt-main-guard`는 Edit/Write 도구만 막는다. Bash(`sed -i`, 리다이렉트)로 우회하지 않는 것은 규칙으로 지킨다.
 
@@ -161,6 +161,8 @@ wt finish --title "..."    # 워크트리 안에서
 ## 12. 정리와 잔재 금지
 
 - 보고 전에 `wt list`로 내가 만든 워크트리·브랜치가 남았는지 본다. 남겨야 하면 경로·이유·다음 할 일을 보고에 적는다.
+- **참고용으로 일부러 남기지 않는다.** 머지하지 않기로 한 작업(보류·철회된 시도)은 남길 내용을 계획 문서나 커밋된 문서로 옮긴 뒤 같은 작업 안에서 워크트리·브랜치를 지운다(`git worktree remove` + `git branch -D`, 이유를 보고에 적는다). "참고용 WIP 워크트리"는 다음 세션의 잔재가 된다.
+- 자동 정리: 세션 시작 훅이 기본 브랜치에 반영된 워크트리·브랜치를 `wt gc --apply`로 지운다(다른 세션 사용 중·24시간 내 사용·미커밋 변경은 건너뜀). 기본 브랜치에 없는 커밋을 가진 채 14일(`WT_STALE_DAYS`) 넘게 방치된 항목은 `[오래됨]`으로 표시된다 — 자동 삭제하지 말고 내용을 요약해 사용자에게 정리 여부를 묻는다. `<저장소>.wt/` 밖의 워크트리(배포용 사본 등)는 `[wt 관리 밖]`으로 표시되고 알림에서 빠진다.
 - **워크트리를 손으로 지우지 않는다.** `git worktree unlock/remove`, 경로 `rm -r` 대신 `wt finish`·`wt gc --apply`만 쓴다. 커밋이 없어 보여도 다른 세션 에이전트가 첫 커밋 전일 수 있다.
 - `wt gc`가 건너뛰는 것: 미커밋 변경, 다른 세션 사용 중, 다른 세션 에이전트 잠금, 24시간 내 사용, 기본 브랜치에 없는 커밋.
 - 반영 판정은 조상 관계, `git cherry` patch-id, `git merge-tree` 결과가 기본 브랜치 트리와 같은지까지 보므로 squash 머지도 잡는다.

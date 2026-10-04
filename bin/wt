@@ -3,7 +3,7 @@
 #
 #   wt start <슬러그> [--base <브랜치>]   origin/<기본 브랜치>에서 wt/<슬러그> 워크트리 생성
 #   wt finish [--title <제목>]           (워크트리 안에서) rebase → 검증 → PR → squash 머지 → 정리
-#   wt list                              워크트리·wt 브랜치 상태
+#   wt list                              워크트리·wt 브랜치 상태(미반영 커밋으로 WT_STALE_DAYS=14일 방치되면 [오래됨])
 #   wt gc [--apply]                      이미 main에 반영된 워크트리·브랜치 정리(기본은 목록만)
 #   wt overlap                           (워크트리 안에서) 다른 레인과 겹치는 파일
 #   wt claim [--force]                   (워크트리 안에서) 이 세션이 이 워크트리를 맡는다(재개·인계)
@@ -85,6 +85,26 @@ agent_lock_state() {
   [ -n "$lp" ] || { echo none; return; }
   if [ "$lp" = "${WT_CLAUDE_PID:-$(claude_pid)}" ]; then echo mine; elif pid_alive "$lp"; then echo "other $lp"; else echo stale; fi
 }
+# 마지막 활동(브랜치 마지막 커밋, 워크트리면 git-dir·최상위 항목 수정 시각 중 최신) 이후 지난 일수.
+idle_days() {
+  local b=$1 w=${2-} last m gd
+  last=$(git log -1 --format=%ct "$b" 2>/dev/null || echo 0)
+  if [ -n "$w" ]; then
+    gd=$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null || true)
+    # 사라진 워크트리·BSD find(-printf 없음)에서도 list를 멈추지 않게 실패는 무시한다(커밋 시각만 쓴다).
+    m=$(find ${gd:+"$gd"} "$w" -maxdepth 1 -printf '%T@\n' 2>/dev/null | sort -n | tail -n 1 | cut -d. -f1) || m=""
+    [ -n "$m" ] && [ "$m" -gt "$last" ] && last=$m
+  fi
+  echo $(( ($(date +%s) - last) / 86400 ))
+}
+# main에 없는 커밋을 가진 채 WT_STALE_DAYS(기본 14)일 넘게 손대지 않은 항목 표시. 자동 삭제는 하지 않는다.
+stale_label() {
+  local d; d=$(idle_days "$@")
+  [ "$d" -ge "${WT_STALE_DAYS:-14}" ] && echo " [오래됨 ${d}일 — 사용자에게 정리 여부 확인]"
+  return 0
+}
+# <저장소>.wt/ 밖의 워크트리(배포용 사본 등)는 wt가 만든 작업 레인이 아니다.
+wt_managed() { case $1 in "$(dirname "$(main_root)")/$(basename "$(main_root)").wt/"*) return 0 ;; *) return 1 ;; esac; }
 owner_label() {
   case $1 in
     mine) echo " [이 세션]" ;;
@@ -324,17 +344,20 @@ cmd_list() {
     while IFS=$'\t' read -r w b; do
       [ "$w" = "$(main_root)" ] && continue
       local st=""; [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ] && st=" 미커밋변경"
-      if [ "$b" = "(detached)" ]; then printf '  워크트리 %s  (detached)%s\n' "$w" "$st"; continue; fi
+      local mg=""; wt_managed "$w" || mg=" [wt 관리 밖]"
+      if [ "$b" = "(detached)" ]; then printf '  워크트리 %s  (detached)%s%s\n' "$w" "$st" "$mg"; continue; fi
       local ahead; ahead=$(git rev-list --count "$ref..$b")
-      local merged=""; content_in_base "$ref" "$b" && merged=" [main에 반영됨]"
+      local merged="" stale=""
+      if content_in_base "$ref" "$b"; then merged=" [main에 반영됨]"; else stale=$(stale_label "$b" "$w"); fi
       local al=""; case $(agent_lock_state "$w") in other*) al=" [다른 세션 에이전트 실행 중]" ;; mine) al=" [이 세션 에이전트]" ;; esac
-      printf '  워크트리 %s  %s  +%s%s%s%s%s\n' "$w" "$b" "$ahead" "$merged" "$st" "$(owner_label "$(owner_state "$w")")" "$al"
+      printf '  워크트리 %s  %s  +%s%s%s%s%s%s%s\n' "$w" "$b" "$ahead" "$merged" "$st" "$(owner_label "$(owner_state "$w")")" "$al" "$stale" "$mg"
     done
   git for-each-ref --format='%(refname:short)' refs/heads | while read -r b; do
     [ "$b" = "$base" ] && continue
     git worktree list --porcelain | grep -x "branch refs/heads/$b" >/dev/null && continue
-    local merged=""; content_in_base "$ref" "$b" && merged=" [main에 반영됨]"
-    printf '  브랜치만 %s  +%s%s\n' "$b" "$(git rev-list --count "$ref..$b")" "$merged"
+    local merged="" stale=""
+    if content_in_base "$ref" "$b"; then merged=" [main에 반영됨]"; else stale=$(stale_label "$b"); fi
+    printf '  브랜치만 %s  +%s%s%s\n' "$b" "$(git rev-list --count "$ref..$b")" "$merged" "$stale"
   done
 }
 
