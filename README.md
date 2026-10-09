@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 구분 | 위치 | 하는 일 |
 |---|---|---|
 | 규칙 | `~/.claude/CLAUDE.md` "작업 격리" 절 | Claude가 언제 워크트리를 쓰고 어떻게 끝내는지 |
-| 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / list / gc / overlap / claim |
+| 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / verify / list / gc / overlap / claim |
 | 훅 | `~/.claude/hooks/wt-main-guard` | 메인 폴더의 추적 파일 Edit/Write 차단 |
 | 훅 | `~/.claude/hooks/wt-remove-guard` | 다른 살아 있는 세션의 워크트리 삭제·잠금 해제 차단 |
 | 훅 | `~/.claude/hooks/wt-session-status` | 세션 시작 때 반영된 워크트리 자동 정리 + 남은 워크트리 알림 |
@@ -38,6 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 
 - 워크트리: `<저장소>/../<저장소이름>.wt/<슬러그>` (예: `~/code/app` → `~/code/app.wt/fix-login`)
 - 브랜치: `wt/<슬러그>`, 기준: `origin/<기본 브랜치>` (원격이 없으면 로컬 `main`/`master`)
+- `wt start --base v2`처럼 기준을 바꾸면 `branch.<브랜치>.wtBase`에 남고, 그 레인은 `list`·`gc`·`overlap`·`finish` 모두 그 기준으로 판정·머지된다.
 - 슬러그는 영문·숫자·`. _ -`만.
 - 워크트리는 `wt start` 또는 서브에이전트 `isolation: "worktree"`로만 만든다. `git worktree add` 직접 호출이나 `<저장소>.wt/` 밖 위치는 쓰지 않는다.
 
@@ -47,23 +48,24 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 |---|---|---|
 | `wt start <슬러그> [--base <브랜치>]` | 저장소 안 어디서나 | `origin/<base>` fetch → `wt/<슬러그>` 브랜치로 워크트리 생성 → `.worktreeinclude` 복사 → `.claude/wt-setup.sh` 실행 → 소유 표식 기록 → 다른 레인과 겹치는 파일 출력 → 마지막 줄에 경로 출력 |
 | `wt finish [--title "..."]` | 워크트리 안 | 5절 순서로 머지·정리 |
-| `wt list` | 저장소 안 어디서나 | 워크트리·`wt` 브랜치 상태(앞선 커밋 수, `[main에 반영됨]`, 미커밋 변경, 소유자) |
-| `wt gc [--apply]` | 저장소 안 어디서나 | 이미 반영된 워크트리·브랜치 정리. 기본은 목록만 |
-| `wt overlap` | 워크트리 안 | 다른 레인이 고치고 있는 같은 파일 표시 |
+| `wt verify` | 워크트리 안 | `.claude/wt-verify.sh` 실행. 통과하면 그 코드의 트리 해시를 기록하고, rebase 뒤에도 트리가 같으면 finish가 검증을 건너뛴다. 미커밋 변경이 있으면 거절 |
+| `wt list [--conflicts]` | 저장소 안 어디서나 | 워크트리·브랜치 상태(레인마다 **자기 기준** 대비 앞선 커밋 수, `[기준 v2]`, `[<기준>에 반영됨]`, `[기준 브랜치]`, 미커밋 변경, 소유자). `--conflicts`는 레인별 예상 충돌 |
+| `wt gc [--apply]` | 저장소 안 어디서나 | 자기 기준에 이미 반영된 워크트리·브랜치 정리. 기준 브랜치는 지우지 않는다(12절). 기본은 목록만 |
+| `wt overlap` | 워크트리 안 | 같은 기준의 다른 레인·기준 브랜치와 **미리 합쳐 보고**(`git merge-tree`, 작업 폴더는 그대로) 실제로 충돌할 파일은 `충돌 예상`, 같은 파일이지만 줄이 안 겹치면 `겹침(자동 병합 가능)`. 다른 레인의 미커밋 변경도 포함. git 2.38 미만이면 파일 단위 겹침 |
 | `wt claim [--force]` | 워크트리 안 | 재개·압축·인계 뒤 이 세션이 그 워크트리를 맡는다 |
 
 ## 5. `wt finish` 순서
 
 1. 미커밋 변경·진행 중 rebase가 있으면 중단. 다른 살아 있는 세션 소유면 중단(`wt claim --force` 또는 `WT_FORCE_FINISH=1` 필요).
-2. 다른 레인과 겹치는 파일을 참고로 보여 준다.
+2. 충돌 예고를 한 줄로 요약한다(다른 레인과 충돌 예상, 기준과 충돌 예상, 자동 병합 가능 겹침 개수. 자세히는 `wt overlap`).
 3. 잠금 `<git-common-dir>/wt-finish.lock`을 잡는다. 동시에 끝나는 레인은 차례로 머지된다(최대 10분 대기).
-4. `origin/<base>`를 fetch하고, 새 커밋이 없으면 정리만 한다.
+4. `origin/<base>`를 fetch하고(base = 그 레인의 기준), 새 커밋이 없으면 정리만 한다.
 5. `origin/<base>` 위로 rebase. 충돌이면 중단 → 그 워크트리에서 풀고 `git rebase --continue` → 검증 → finish 재실행.
-6. `.claude/wt-verify.sh`가 있으면 실행. 실패하면 머지하지 않는다.
+6. `.claude/wt-verify.sh`가 있으면 실행. 실패하면 머지하지 않는다. rebase 뒤 트리가 `wt verify`(또는 앞선 finish)가 통과시킨 트리와 같으면 건너뛴다(`WT_FORCE_VERIFY=1`이면 늘 실행).
 7. GitHub 원격 + `gh`가 있으면: push(`--force-with-lease`) → PR 생성(없을 때) → **squash 머지** → 상태가 `MERGED`인지 확인 → 원격 브랜치 삭제.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.
 8. 하네스가 건 `claude agent …` 잠금만 풀고 워크트리·로컬 브랜치 삭제.
-9. 메인 폴더가 기본 브랜치에 있으면 `origin/<base>`로 fast-forward.
+9. 메인 폴더가 그 기준 브랜치에 있으면 `origin/<base>`로 fast-forward.
 
 squash 커밋 메시지: 커밋이 1개면 그 메시지 그대로, 여러 개면 `--title`(없으면 첫 커밋 제목) + 각 커밋 요약 + 중복을 뺀 `Co-Authored-By`.
 
@@ -80,7 +82,7 @@ squash 커밋 메시지: 커밋이 1개면 그 메시지 그대로, 여러 개�
 |---|---|---|
 | `wt-main-guard` | PreToolUse `Edit\|Write\|MultiEdit\|NotebookEdit` | 메인 폴더의 추적 파일 편집을 거부. 통과: git 밖, 연결 워크트리 안, gitignore된 파일, 커밋 없는 저장소, `git config wt.disabled true` |
 | `wt-remove-guard` | PreToolUse `Bash` | `git worktree unlock\|remove\|move`나 워크트리 경로를 가리키는 `rm -r`이 다른 살아 있는 세션(에이전트 잠금 pid 또는 `wt-owner` pid)의 워크트리를 겨누면 거부. `wt finish`/`wt gc`는 스스로 판정하므로 통과 |
-| `wt-session-status` | SessionStart `startup`·`resume`·`clear`·`compact` | `wt gc --apply`로 기본 브랜치에 반영된 워크트리·브랜치를 정리하고, 남은 `wt list` 결과(`[wt 관리 밖]` 제외)를 "[wt] 남아 있는 작업 워크트리·브랜치"로 알려 준다. `[오래됨]`은 사용자에게 정리 여부를 묻는다 |
+| `wt-session-status` | SessionStart `startup`·`resume`·`clear`·`compact` | `wt gc --apply`로 기본 브랜치에 반영된 워크트리·브랜치를 정리하고, 남은 `wt list` 결과(`[wt 관리 밖]`·`[기준 브랜치]` 제외)를 "[wt] 남아 있는 작업 워크트리·브랜치"로 알려 준다. `[오래됨]`은 사용자에게 정리 여부를 묻는다 |
 
 - `wt-main-guard`는 Edit/Write 도구만 막는다. Bash(`sed -i`, 리다이렉트)로 우회하지 않는 것은 규칙으로 지킨다.
 
@@ -103,6 +105,7 @@ set -euo pipefail
 ### `.claude/wt-verify.sh` — `wt finish`가 rebase 뒤, push 전에 실행 (예시: `examples/wt-verify.sh`)
 
 - 0이 아닌 종료면 머지하지 않는다.
+- `wt verify`로 미리 돌려 두면, rebase 뒤 코드(트리)가 같을 때 finish가 같은 검증을 다시 돌리지 않는다. 기준이 그사이 움직여 코드가 달라졌으면 다시 돌린다.
 - 병렬 레인이 차례로 머지되면 각 레인은 앞 레인이 들어간 기본 브랜치 위에서 다시 검증돼야 하므로, 저장소의 전체 검증(포맷·빌드·테스트)을 넣는다.
 - 서브에이전트(`isolation: "worktree"`) 워크트리는 `wt-setup.sh`를 거치지 않으니, 필요하면 여기서도 준비물을 확인한다.
 
@@ -136,7 +139,7 @@ wt finish --title "..."    # 워크트리 안에서
 # Claude: ExitWorktree(action="keep")
 ```
 
-- finish가 rebase 충돌·검증 실패로 멈추면 그 워크트리에서 고쳐 다시 실행한다. 강제 해결·검증 생략은 하지 않는다.
+- finish가 rebase 충돌·검증 실패로 멈추면 그 워크트리에서 고쳐 다시 실행한다. 강제 해결·검증 생략은 하지 않는다. 충돌을 풀었으면 `wt verify` → `wt finish`(같은 코드면 검증을 한 번만 돈다).
 - 머지 차단(보호 규칙·필수 체크)은 사용자에게 보고한다.
 - finish 뒤 원격 브랜치를 손으로 지우지 않는다(이미 지워져 있다).
 - `wt-verify.sh`가 없는 저장소에서 기본 브랜치가 그사이 움직였으면 rebase 뒤 검증을 직접 다시 돌린다.
@@ -162,10 +165,11 @@ wt finish --title "..."    # 워크트리 안에서
 
 - 보고 전에 `wt list`로 내가 만든 워크트리·브랜치가 남았는지 본다. 남겨야 하면 경로·이유·다음 할 일을 보고에 적는다.
 - **참고용으로 일부러 남기지 않는다.** 머지하지 않기로 한 작업(보류·철회된 시도)은 남길 내용을 계획 문서나 커밋된 문서로 옮긴 뒤 같은 작업 안에서 워크트리·브랜치를 지운다(`git worktree remove` + `git branch -D`, 이유를 보고에 적는다). "참고용 WIP 워크트리"는 다음 세션의 잔재가 된다.
-- 자동 정리: 세션 시작 훅이 기본 브랜치에 반영된 워크트리·브랜치를 `wt gc --apply`로 지운다(다른 세션 사용 중·24시간 내 사용·미커밋 변경은 건너뜀). 기본 브랜치에 없는 커밋을 가진 채 14일(`WT_STALE_DAYS`) 넘게 방치된 항목은 `[오래됨]`으로 표시된다 — 자동 삭제하지 말고 내용을 요약해 사용자에게 정리 여부를 묻는다. `<저장소>.wt/` 밖의 워크트리(배포용 사본 등)는 `[wt 관리 밖]`으로 표시되고 알림에서 빠진다.
+- 자동 정리: 세션 시작 훅이 자기 기준에 반영된 워크트리·브랜치를 `wt gc --apply`로 지운다(다른 세션 사용 중·24시간 내 사용·미커밋 변경은 건너뜀). 기본 브랜치에 없는 커밋을 가진 채 14일(`WT_STALE_DAYS`) 넘게 방치된 항목은 `[오래됨]`으로 표시된다 — 자동 삭제하지 말고 내용을 요약해 사용자에게 정리 여부를 묻는다. `<저장소>.wt/` 밖의 워크트리(배포용 사본 등)는 `[wt 관리 밖]`으로 표시되고 알림에서 빠진다.
 - **워크트리를 손으로 지우지 않는다.** `git worktree unlock/remove`, 경로 `rm -r` 대신 `wt finish`·`wt gc --apply`만 쓴다. 커밋이 없어 보여도 다른 세션 에이전트가 첫 커밋 전일 수 있다.
-- `wt gc`가 건너뛰는 것: 미커밋 변경, 다른 세션 사용 중, 다른 세션 에이전트 잠금, 24시간 내 사용, 기본 브랜치에 없는 커밋.
-- 반영 판정은 조상 관계, `git cherry` patch-id, `git merge-tree` 결과가 기본 브랜치 트리와 같은지까지 보므로 squash 머지도 잡는다.
+- `wt gc`가 건너뛰는 것: 미커밋 변경, 다른 세션 사용 중, 다른 세션 에이전트 잠금, 24시간 내 사용, 자기 기준에 없는 커밋, **기준 브랜치**(`유지(기준 브랜치)`).
+- 기준 브랜치 = 기본 브랜치, 어떤 브랜치의 `wtBase` 값으로 쓰이는 브랜치, 원격에 같은 이름이 있고 원격이 로컬보다 앞선 브랜치(오래된 로컬 `v2`가 기본 브랜치에 들어 있어도 지우지 않는다), `git config wt.protect "v2 release/*"`의 공백 구분 패턴. `wt list`에는 `[기준 브랜치]`로 보이고 세션 알림에서 빠진다.
+- 반영 판정은 레인마다 자기 기준(`origin/<wtBase>`, 없으면 기본 브랜치)에 대해 조상 관계, `git cherry` patch-id, `git merge-tree` 결과가 기준 트리와 같은지까지 보므로 squash 머지도 잡는다.
 - `wt finish`가 아닌 방법(합본 커밋, cherry-pick, 수동 병합)으로 넣었으면 같은 작업 안에서 `git worktree remove` + `git branch -D`로 지운다.
 - 남은 워크트리를 "미병합"으로 보고하기 전에 핵심 변경이 기본 브랜치에 있는지 `git log`/`git grep`으로 대조한다.
 
@@ -176,7 +180,8 @@ wt finish --title "..."    # 워크트리 안에서
 | 메인 폴더에서 Edit가 거부됨 | `wt start <슬러그>` 후 워크트리에서 편집 |
 | 재개·압축 뒤 내 워크트리를 이어 씀 | 그 안에서 `wt claim` (주인이 끝난 게 확실할 때만 `--force`) |
 | finish가 "다른 finish가 진행 중" | 기다린다. 10분 넘게 멈춘 잠금이면 `rmdir <git-common-dir>/wt-finish.lock` |
-| finish가 rebase 충돌 | 그 워크트리에서 해결 → `git rebase --continue` → 검증 → finish 재실행 |
+| finish가 rebase 충돌 | 그 워크트리에서 해결 → `git rebase --continue` → `wt verify` → finish 재실행(같은 코드면 검증 생략) |
+| 다른 기준(예: `v2`)에서 작업 | `wt start <슬러그> --base v2`. finish가 v2로 머지한다. 장기 브랜치는 필요하면 `git config wt.protect v2` |
 | finish가 검증 실패 | 고쳐서 커밋 → finish 재실행 |
 | 한 저장소만 이 체계에서 빼기 | 그 저장소에서 `git config wt.disabled true` |
 | 남은 워크트리 정리 | `wt gc`(목록) → `wt gc --apply` |
@@ -200,7 +205,7 @@ wt finish --title "..."    # 워크트리 안에서
 | 항목 | 이유 |
 |---|---|
 | macOS 또는 Linux, bash, curl | 설치·도구 실행 |
-| git **2.38 이상** | squash 반영 판정이 `git merge-tree --write-tree`를 쓴다 |
+| git **2.38 이상** | squash 반영 판정·줄 단위 충돌 예고가 `git merge-tree --write-tree`를 쓴다(미만이면 충돌 예고는 파일 단위) |
 | `/usr/bin/python3` | 훅이 JSON 입출력에 쓴다. 경로가 다르면 설치가 경고하니 훅 안의 경로를 바꾼다 |
 | `gh` (로그인된 상태, 선택) | GitHub 원격이면 PR 생성·squash 머지. 없거나 GitHub가 아니면 로컬 squash 후 push |
 | Claude Code 프로세스 이름이 `claude` | 소유 표식이 부모 프로세스 중 `ps -o comm=`이 `claude`인 것을 찾는다. `node`로 보이는 설치라면 세션 구분이 동작하지 않는다(나머지는 동작) |

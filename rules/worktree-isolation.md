@@ -8,9 +8,9 @@
 - 쓰지 않는 경우: git 밖 폴더(`~/.claude` 등), gitignore된 파일, 조회·명령 실행만 하는 작업, 커밋이 없는 새 저장소, `git config wt.disabled true`(사용자가 정한 저장소만).
 
 **시작**
-- `wt start <슬러그>` → 출력된 경로로 `EnterWorktree(path=...)`. 위치 `<저장소>/../<저장소>.wt/<슬러그>`, 브랜치 `wt/<슬러그>`, 기준 `origin/<기본 브랜치>`.
+- `wt start <슬러그>` → 출력된 경로로 `EnterWorktree(path=...)`. 위치 `<저장소>/../<저장소>.wt/<슬러그>`, 브랜치 `wt/<슬러그>`, 기준 `origin/<기본 브랜치>`. 다른 브랜치로 머지할 작업은 `wt start <슬러그> --base <브랜치>`(그 레인은 list·gc·finish 모두 그 기준).
 - 워크트리는 `wt start`나 서브에이전트 `isolation: "worktree"`로만 만든다. `git worktree add` 직접 호출, `<저장소>.wt/` 밖 위치는 쓰지 않는다.
-- `wt start`는 이 세션을 주인으로 표식하고(세션 ID·claude pid), 다른 레인이 고치고 있는 파일을 보여 준다. 같은 파일을 고칠 참이면 그 레인이 끝난 뒤 하거나 그 레인에 합칠지 먼저 판단한다. 작업 중에는 `wt overlap`으로 다시 본다.
+- `wt start`는 이 세션을 주인으로 표식하고(세션 ID·claude pid), 다른 레인이 고치고 있는 파일을 보여 준다. 같은 파일을 고칠 참이면 그 레인이 끝난 뒤 하거나 그 레인에 합칠지 먼저 판단한다. 작업 중에는 `wt overlap`으로 다시 본다(`충돌 예상`만 조정하면 된다. `겹침(자동 병합 가능)`은 같은 파일이지만 줄이 안 겹친다).
 
 **다른 세션과 겹치지 않기**
 - `wt list`·세션 시작 알림의 `[다른 세션 사용 중]` 워크트리는 건드리지 않는다(`wt finish`·`wt gc`도 막는다). `[주인 세션 종료됨]`이나 표식 없는 것은 내가 만든 게 아니면 사용자에게 묻는다.
@@ -21,7 +21,7 @@
 **끝낼 때**
 - 커밋 → 저장소 검증 → 워크트리 안에서 `wt finish [--title "..."]` → `ExitWorktree(action="keep")`. finish가 rebase → `.claude/wt-verify.sh`(있으면) → push → PR → **squash 머지** → 브랜치·워크트리 삭제 → 메인 폴더 fast-forward까지 한다(원격이 없거나 GitHub가 아니면 로컬 squash). 동시에 끝나면 잠금으로 차례로 머지한다.
 - `wt-verify.sh`가 없는 저장소에서 main이 그사이 움직였으면 rebase 뒤 검증을 직접 다시 돌리고 finish한다.
-- finish가 rebase 충돌·검증 실패로 멈추면 그 워크트리에서 고쳐 다시 실행한다. 강제 해결·검증 생략은 하지 않는다. 머지 차단(보호 규칙·체크)은 사용자에게 보고한다.
+- finish가 rebase 충돌·검증 실패로 멈추면 그 워크트리에서 고쳐 다시 실행한다. 강제 해결·검증 생략은 하지 않는다. 충돌을 풀었으면 `wt verify` 후 `wt finish`(코드가 같으면 finish가 같은 검증을 건너뛴다). 머지 차단(보호 규칙·체크)은 사용자에게 보고한다.
 - finish 뒤 원격 브랜치를 손으로 다시 지우지 않는다(이미 지워져 있다).
 - 병렬 서브에이전트는 `isolation: "worktree"`로 띄우고, **완료 알림을 받은 뒤에만** 각 워크트리에서 `wt finish`한다. 하네스가 건 `claude agent …` 잠금은 finish가 스스로 푼다.
 
