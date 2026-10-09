@@ -217,6 +217,8 @@ wt finish --title "..."    # 워크트리 안에서
 | `rules/worktree-isolation.md` | `~/.claude/CLAUDE.md` 끝에 "작업 격리" 절 — 같은 제목 절이 있으면 건너뜀 |
 | (install.sh 안) | `~/.zshrc`·`~/.bashrc`(있는 것만)에 `PATH="$HOME/.claude/bin:$PATH"` |
 
+갱신은 `wt finish`·`wt train`이 돌고 있지 않을 때 한다. 머지 잠금이 폴더(`wt-finish.lock`)에서 flock(`wt-merge.lock`)으로 바뀐 판부터는 갱신 전에 시작된 옛 finish와 새 finish·train이 서로를 기다리지 않는다. `<git-common-dir>/wt-finish.lock` 폴더가 있으면 그 finish가 끝난 뒤 갱신한다. 갱신·설치가 끝나면 같은 제목 절이 이미 있는 `~/.claude/CLAUDE.md`는 바뀌지 않으니, `rules/worktree-isolation.md`의 새 문장을 직접 옮긴다.
+
 바뀌는 기존 파일은 `*.bak-<시각>`으로 남긴다. 특정 버전은 `CLAUDE_WT_REF=<태그> bash install.sh`(파이프 설치면 `curl ... | CLAUDE_WT_REF=<태그> bash`).
 
 ### 필요 조건
