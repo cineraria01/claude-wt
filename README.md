@@ -61,6 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 3. 잠금 `<git-common-dir>/wt-finish.lock`을 잡는다. 동시에 끝나는 레인은 차례로 머지된다(최대 10분 대기).
 4. `origin/<base>`를 fetch하고(base = 그 레인의 기준), 새 커밋이 없으면 정리만 한다.
 5. `origin/<base>` 위로 rebase. 충돌이면 중단 → 그 워크트리에서 풀고 `git rebase --continue` → 검증 → finish 재실행.
+   - 기준이 이미 들어 있으면 rebase하지 않는다. 레인 안에 합치기 커밋이 있으면(여러 레인을 합친 통합 레인) rebase 대신 기준을 merge로 받는다. rebase는 합치기를 한 줄로 다시 쌓아 이미 푼 충돌을 또 내기 때문이다. squash 머지라 결과는 같다. merge 충돌이면 풀고 `git commit` → 검증 → finish 재실행.
 6. `.claude/wt-verify.sh`가 있으면 실행. 실패하면 머지하지 않는다. rebase 뒤 트리가 `wt verify`(또는 앞선 finish)가 통과시킨 트리와 같으면 건너뛴다(`WT_FORCE_VERIFY=1`이면 늘 실행).
 7. GitHub 원격 + `gh`가 있으면: push(`--force-with-lease`) → PR 생성(없을 때) → **squash 머지** → 상태가 `MERGED`인지 확인 → 원격 브랜치 삭제.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.

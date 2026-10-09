@@ -138,6 +138,24 @@ rc=0; out=$(cd "$E" && LC_ALL=en_US.UTF-8 "$WT" finish 2>&1) || rc=$?
 check "커밋 없는 finish가 정리만 하고 성공" [ "$rc" = 0 ]
 check "정리만 안내" has "$out" "새로 들어갈 커밋이 없습니다"
 check "빈 레인 정리됨" [ ! -e "$E" ]
+echo "⑥ 합치기 커밋이 있는 통합 레인"
+# 두 하위 브랜치가 같은 줄을 고치고 통합 레인이 그 충돌을 merge로 풀었다. rebase는 이를 한 줄로 다시 쌓아 같은 충돌을 또 냈다.
+I=$(start integrate)
+(cd "$I" && git checkout -qb sub1 && sed -i.bak 's/^5$/five-a/' a.txt && rm a.txt.bak && git commit -qam sub1 \
+  && git checkout -q wt/integrate && git checkout -qb sub2 && sed -i.bak 's/^5$/five-b/' a.txt && rm a.txt.bak && git commit -qam sub2 \
+  && git checkout -q wt/integrate && git merge -q --no-ff sub1 -m m1 && { git merge -q --no-ff sub2 -m m2 >/dev/null 2>&1 || true; } \
+  && sed -i.bak 's/^<<<<<<<.*$//; s/^=======$//; s/^>>>>>>>.*$//' a.txt && rm a.txt.bak && git commit -qam m2 && git branch -qD sub1 sub2)
+rc=0; out=$(cd "$I" && "$WT" finish 2>&1) || rc=$?
+check "기준 그대로인 통합 레인 finish 성공" [ "$rc" = 0 ]
+check "rebase 생략 안내" has "$out" "rebase 없이 진행합니다"
+J=$(start integrate2)
+(cd "$J" && git checkout -qb s1 && echo x >j1.txt && git add -A && git commit -qm s1 && git checkout -q wt/integrate2 && git merge -q --no-ff s1 -m m && git branch -qD s1)
+push_from_elsewhere main moved.txt moved
+rc=0; out=$(cd "$J" && "$WT" finish 2>&1) || rc=$?
+check "기준이 움직인 통합 레인은 merge로 받아 성공" [ "$rc" = 0 ]
+check "merge 안내" has "$out" "rebase 대신 origin/main을 merge합니다"
+check "두 레인 내용 모두 main에" bash -c "git -C '$R' cat-file -e origin/main:j1.txt && git -C '$R' cat-file -e origin/main:moved.txt"
+
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
 bad=[f"{p}:{i}" for p in sys.argv[1:] for i,l in enumerate(open(p,encoding="utf-8"),1) if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[\uac00-\ud7a3]",l)]
