@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 구분 | 위치 | 하는 일 |
 |---|---|---|
 | 규칙 | `~/.claude/CLAUDE.md` "작업 격리" 절 | Claude가 언제 워크트리를 쓰고 어떻게 끝내는지 |
-| 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / verify / list / gc / overlap / claim |
+| 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / train / verify / list / gc / overlap / claim |
 | 훅 | `~/.claude/hooks/wt-main-guard` | 메인 폴더의 추적 파일 Edit/Write 차단 |
 | 훅 | `~/.claude/hooks/wt-remove-guard` | 다른 살아 있는 세션의 워크트리 삭제·잠금 해제 차단 |
 | 훅 | `~/.claude/hooks/wt-session-status` | 세션 시작 때 반영된 워크트리 자동 정리 + 남은 워크트리 알림 |
@@ -48,6 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 |---|---|---|
 | `wt start <슬러그> [--base <브랜치>]` | 저장소 안 어디서나 | `origin/<base>` fetch → `wt/<슬러그>` 브랜치로 워크트리 생성 → `.worktreeinclude` 복사 → `.claude/wt-setup.sh` 실행 → 소유 표식 기록 → 다른 레인과 겹치는 파일 출력 → 마지막 줄에 경로 출력 |
 | `wt finish [--title "..."]` | 워크트리 안 | 5절 순서로 머지·정리 |
+| `wt train [--title "..."] <레인>...` | 저장소 안 어디서나 | 끝난 레인 여럿을 검증 한 번으로 한꺼번에 머지(5-1절). 레인은 슬러그·브랜치·워크트리 경로 |
 | `wt verify` | 워크트리 안 | `.claude/wt-verify.sh` 실행. 통과하면 그 코드의 트리 해시를 기록하고, rebase 뒤에도 트리가 같으면 finish가 검증을 건너뛴다. 미커밋 변경이 있으면 거절 |
 | `wt list [--conflicts]` | 저장소 안 어디서나 | 워크트리·브랜치 상태(레인마다 **자기 기준** 대비 앞선 커밋 수, `[기준 v2]`, `[<기준>에 반영됨]`, `[기준 브랜치]`, 미커밋 변경, 소유자). `--conflicts`는 레인별 예상 충돌 |
 | `wt gc [--apply]` | 저장소 안 어디서나 | 자기 기준에 이미 반영된 워크트리·브랜치 정리. 기준 브랜치는 지우지 않는다(12절). 기본은 목록만 |
@@ -58,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 
 1. 미커밋 변경·진행 중 rebase가 있으면 중단. 다른 살아 있는 세션 소유면 중단(`wt claim --force` 또는 `WT_FORCE_FINISH=1` 필요).
 2. 충돌 예고를 한 줄로 요약한다(다른 레인과 충돌 예상, 기준과 충돌 예상, 자동 병합 가능 겹침 개수. 자세히는 `wt overlap`).
-3. 잠금 `<git-common-dir>/wt-finish.lock`을 잡는다. 동시에 끝나는 레인은 차례로 머지된다(최대 10분 대기).
+3. 잠금 `<git-common-dir>/wt-finish.lock`을 잡는다. 동시에 끝나는 레인은 차례로 머지된다. 잠금 폴더에 쥔 프로세스의 pid를 남겨, 그 프로세스가 살아 있는 동안은 기다리고(1분마다 안내) 죽었으면(강제 종료로 정리를 못 한 경우) 잠금을 회수한다. pid가 없는 옛 잠금만 10분 뒤 포기한다.
 4. `origin/<base>`를 fetch하고(base = 그 레인의 기준), 새 커밋이 없으면 정리만 한다.
 5. `origin/<base>` 위로 rebase. 충돌이면 중단 → 그 워크트리에서 풀고 `git rebase --continue` → 검증 → finish 재실행.
    - 기준이 이미 들어 있으면 rebase하지 않는다. 레인 안에 합치기 커밋이 있으면(여러 레인을 합친 통합 레인) rebase 대신 기준을 merge로 받는다. rebase는 합치기를 한 줄로 다시 쌓아 이미 푼 충돌을 또 내기 때문이다. squash 머지라 결과는 같다. merge 충돌이면 풀고 `git commit` → 검증 → finish 재실행.
@@ -67,6 +68,19 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.
 8. 하네스가 건 `claude agent …` 잠금만 풀고 워크트리·로컬 브랜치 삭제.
 9. 메인 폴더가 그 기준 브랜치에 있으면 `origin/<base>`로 fast-forward.
+
+## 5-1. `wt train` — 여러 레인을 한 번에
+
+병렬 레인이 함께 끝나면 `wt finish`는 레인마다 rebase → 전체 검증 → 머지를 잠금 안에서 차례로 돈다. 앞 레인이 기준을 바꾸니 검증 기록도 매번 빗나가 전체 검증이 레인 수만큼 돈다. `wt train`은 이것을 한 번으로 줄인다.
+
+1. 레인을 모두 확인한다(워크트리 있음, 미커밋 변경·진행 중 rebase 없음, 다른 세션 소유·다른 세션 에이전트 잠금 아님, **모두 같은 기준**). 하나라도 안 되면 아무것도 하지 않는다.
+2. 잠금을 한 번 잡고 `origin/<base>`에 임시 통합 워크트리(`<저장소>.wt/.train-<pid>`, detached)를 만든다. `.worktreeinclude`·`.claude/wt-setup.sh`도 적용한다.
+3. 준 순서대로 레인마다 `git merge --squash` → 커밋 하나(메시지는 finish의 squash 메시지와 같다). 충돌 나는 레인은 빼고 계속한다. 이미 기준에 들어 있는 레인은 정리만 한다.
+4. `.claude/wt-verify.sh`를 통합 결과에서 **한 번** 실행한다. 실패하면 아무것도 머지하지 않고 레인을 그대로 둔다 → 레인마다 `wt finish`로 각자 검증·머지.
+5. GitHub 원격 + `gh`면 통합 결과를 `wt/train-…` 브랜치로 push → PR → **rebase 머지**(레인마다 커밋 하나가 그대로 남는다) → `MERGED` 확인 → 원격 브랜치 삭제. 저장소에서 rebase 머지를 꺼 두었으면 머지 단계에서 멈춘다. 원격이 없거나 GitHub가 아니면 기준 브랜치로 push·fast-forward.
+6. 통합 워크트리, 머지된 레인·이미 들어 있던 레인의 워크트리·브랜치(원격에 있던 레인 브랜치 포함)를 지우고 메인 폴더를 fast-forward. 충돌로 뺀 레인은 목록을 출력하고 남긴다 → 그 워크트리에서 `wt finish`.
+
+레인 하나만 끝났으면 `wt finish`를 쓴다(그쪽은 `wt verify` 기록으로 검증을 건너뛸 수 있다).
 
 squash 커밋 메시지: 커밋이 1개면 그 메시지 그대로, 여러 개면 `--title`(없으면 첫 커밋 제목) + 각 커밋 요약 + 중복을 뺀 `Co-Authored-By`.
 
@@ -180,7 +194,8 @@ wt finish --title "..."    # 워크트리 안에서
 |---|---|
 | 메인 폴더에서 Edit가 거부됨 | `wt start <슬러그>` 후 워크트리에서 편집 |
 | 재개·압축 뒤 내 워크트리를 이어 씀 | 그 안에서 `wt claim` (주인이 끝난 게 확실할 때만 `--force`) |
-| finish가 "다른 finish가 진행 중" | 기다린다. 10분 넘게 멈춘 잠금이면 `rmdir <git-common-dir>/wt-finish.lock` |
+| finish가 "다른 finish가 진행 중" | 기다린다. 쥔 프로세스가 죽으면 다음 finish가 잠금을 회수한다 |
+| 병렬 레인이 여럿 함께 끝남 | 레인마다 finish 대신 `wt train <레인>...`(검증 한 번). 충돌로 빠진 레인은 그 워크트리에서 `wt finish` |
 | finish가 rebase 충돌 | 그 워크트리에서 해결 → `git rebase --continue` → `wt verify` → finish 재실행(같은 코드면 검증 생략) |
 | 다른 기준(예: `v2`)에서 작업 | `wt start <슬러그> --base v2`. finish가 v2로 머지한다. 장기 브랜치는 필요하면 `git config wt.protect v2` |
 | finish가 검증 실패 | 고쳐서 커밋 → finish 재실행 |

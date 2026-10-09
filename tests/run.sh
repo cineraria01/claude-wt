@@ -156,6 +156,59 @@ check "기준이 움직인 통합 레인은 merge로 받아 성공" [ "$rc" = 0 
 check "merge 안내" has "$out" "rebase 대신 origin/main을 merge합니다"
 check "두 레인 내용 모두 main에" bash -c "git -C '$R' cat-file -e origin/main:j1.txt && git -C '$R' cat-file -e origin/main:moved.txt"
 
+echo "⑦ 멈춘 잠금 회수"
+LOCK="$(git -C "$R" rev-parse --git-common-dir)/wt-finish.lock"
+DEAD=$(bash -c 'echo $$')   # 이미 끝난 프로세스의 pid
+mkdir "$LOCK"; echo "$DEAD" >"$LOCK/pid"
+K=$(start after-crash); echo k >"$K/k.txt"; commit "$K" "after crash"
+rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
+check "죽은 pid의 잠금을 회수하고 finish 성공" [ "$rc" = 0 ]
+check "회수 안내" has "$out" "멈춘 잠금을 회수합니다(쥐고 있던 pid $DEAD"
+check "finish 뒤 잠금 없음" [ ! -e "$LOCK" ]
+mkdir "$LOCK"; sleep 2 & echo $! >"$LOCK/pid"   # 살아 있는 쥔 쪽: 끝날 때까지 기다린 뒤 진행
+K=$(start after-wait); echo k2 >"$K/k2.txt"; commit "$K" "after wait"
+t0=$(date +%s); rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
+check "살아 있는 동안 기다렸다가 성공" bash -c "[ $rc = 0 ] && [ $(( $(date +%s) - t0 )) -ge 1 ]"
+check "대기 안내" has "$out" "가 진행 중이라 기다립니다"
+
+echo "⑧ wt train: 쌓기·충돌 레인 빼기·검증 한 번·레인별 커밋"
+git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
+T1=$(start t1); echo t1 >"$T1/t1.txt"; commit "$T1" "t1: 새 파일"
+T2=$(start t2); sed -i.bak '10s/.*/T2/' "$T2/a.txt"; rm "$T2/a.txt.bak"; commit "$T2" "t2: 10번 줄"
+(cd "$T2" && echo t2b >t2.txt && git add -A && git commit -qm "t2: 둘째 커밋")
+T3=$(start t3); sed -i.bak '10s/.*/T3/' "$T3/a.txt"; rm "$T3/a.txt.bak"; commit "$T3" "t3: 같은 줄"
+T4=$(start t4)   # 커밋 없는 레인
+runs=$(verify_runs)
+rc=0; out=$("$WT" train t1 wt/t2 "$T3" t4 2>&1) || rc=$?
+check "train 성공" [ "$rc" = 0 ]
+check "검증은 한 번" [ "$(verify_runs)" = $((runs + 1)) ]
+check "t1·t2 내용이 main에" bash -c "git -C '$R' cat-file -e origin/main:t1.txt && git -C '$R' cat-file -e origin/main:t2.txt && [ \"\$(git -C '$R' show origin/main:a.txt | sed -n 10p)\" = T2 ]"
+check "레인마다 커밋 하나(2개)" [ "$(git -C "$R" rev-list --count "$BEFORE..origin/main")" = 2 ]
+check "t2는 두 커밋을 squash" has "$(git -C "$R" log -1 --format=%B origin/main)" "* t2: 둘째 커밋"
+check "충돌 레인 안내" has "$out" "충돌로 뺌: wt/t3"
+check "충돌 레인은 남음" [ -d "$T3" ]
+check "머지·빈 레인은 정리" bash -c "[ ! -e '$T1' ] && [ ! -e '$T2' ] && [ ! -e '$T4' ]"
+check "통합 워크트리 정리" bash -c "! git -C '$R' worktree list | grep -F .train- >/dev/null"
+check "메인 폴더 fast-forward" [ -f "$R/t1.txt" ]
+rc=0; out=$(cd "$T3" && "$WT" finish 2>&1) || rc=$?
+check "남은 충돌 레인은 finish에서 rebase 충돌" has "$out" "rebase 충돌"
+(cd "$T3" && git rebase --abort)
+
+echo "⑨ wt train: 묶음 검증 실패면 아무것도 머지 안 함, 기준이 다르면 거절"
+git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
+U1=$(start u1); echo u1 >"$U1/u1.txt"; commit "$U1" "u1"
+U2=$(start u2); printf '#!/usr/bin/env bash\nexit 1\n' >"$U2/.claude/wt-verify.sh"; commit "$U2" "u2: 검증 깨짐"
+rc=0; out=$("$WT" train u1 u2 2>&1) || rc=$?
+check "검증 실패면 train 실패" [ "$rc" != 0 ]
+check "실패 안내" has "$out" "묶음 검증 실패. 아무것도 머지하지 않았습니다"
+git -C "$R" fetch -q origin
+check "main 그대로" [ "$(git -C "$R" rev-parse origin/main)" = "$BEFORE" ]
+check "레인 둘 다 남음" bash -c "[ -d '$U1' ] && [ -d '$U2' ]"
+check "실패해도 통합 워크트리·잠금 정리" bash -c "! git -C '$R' worktree list | grep -F .train- >/dev/null && [ ! -e '$LOCK' ]"
+rc=0; out=$("$WT" train u1 v2-empty 2>&1) || rc=$?
+check "기준이 다른 레인 섞으면 거절" has "$out" "기준이 다른 레인은 함께 묶지 못합니다"
+check "다른 세션 레인은 거절" has "$("$WT" train u1 owned 2>&1 || true)" "다른 세션이 쓰는 워크트리입니다"
+
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
 bad=[f"{p}:{i}" for p in sys.argv[1:] for i,l in enumerate(open(p,encoding="utf-8"),1) if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[\uac00-\ud7a3]",l)]
