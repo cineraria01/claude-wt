@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SessionStart: 이미 main에 반영된 워크트리·브랜치는 자동 정리(wt gc --apply)하고,
+# SessionStart: 이미 기준 브랜치에 반영된 워크트리·브랜치는 자동 정리(wt gc --apply)하고,
 # 남은 작업 워크트리·브랜치를 알려 준다. 없으면 조용히 끝낸다.
 input=$(cat)
 # 이 세션의 ID를 wt에 넘겨 [이 세션]/[다른 세션 사용 중]을 가른다.
@@ -13,17 +13,17 @@ git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 # fetch가 걸려도 세션 시작을 붙잡지 않게 시간 제한을 둔다.
 limit=""; command -v timeout >/dev/null 2>&1 && limit="timeout 25"
 cleaned=$($limit "$HOME/.claude/bin/wt" gc --apply 2>&1 | grep '정리 대상' || true)
-# [wt 관리 밖](배포용 사본 등)은 작업 레인이 아니므로 알리지 않는다.
-out=$("$HOME/.claude/bin/wt" list 2>/dev/null | tail -n +2 | grep -v '\[wt 관리 밖\]' || true)
+# [wt 관리 밖](배포용 사본 등)·[기준 브랜치](v2 같은 장기 브랜치)는 작업 레인이 아니므로 알리지 않는다.
+out=$("$HOME/.claude/bin/wt" list 2>/dev/null | tail -n +2 | grep -v -e '\[wt 관리 밖\]' -e '\[기준 브랜치\]' || true)
 [ -n "$out$cleaned" ] || exit 0
 msg=""
 if [ -n "$cleaned" ]; then
-  msg="[wt] main에 반영된 워크트리·브랜치를 자동 정리했다:
+  msg="[wt] 기준 브랜치에 반영된 워크트리·브랜치를 자동 정리했다:
 $cleaned
 "
 fi
 if [ -n "$out" ]; then
-  msg="${msg}[wt] 이 저장소에 남아 있는 작업 워크트리·브랜치([다른 세션 사용 중]은 건드리지 않는다. 이어서 쓸 내 워크트리는 그 안에서 wt claim, 정리는 wt gc. [오래됨]은 main에 없는 커밋을 가진 채 오래 방치된 것 — 자동 삭제하지 말고 내용을 요약해 사용자에게 정리 여부를 묻는다):
+  msg="${msg}[wt] 이 저장소에 남아 있는 작업 워크트리·브랜치([다른 세션 사용 중]은 건드리지 않는다. 이어서 쓸 내 워크트리는 그 안에서 wt claim, 정리는 wt gc. [오래됨]은 기준 브랜치에 없는 커밋을 가진 채 오래 방치된 것 — 자동 삭제하지 말고 내용을 요약해 사용자에게 정리 여부를 묻는다):
 $out"
 fi
 /usr/bin/python3 -c 'import json,sys; print(json.dumps({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":sys.argv[1]}},ensure_ascii=False))' "$msg"
