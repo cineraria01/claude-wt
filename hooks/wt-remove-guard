@@ -37,7 +37,7 @@ while IFS=$'\t' read -r w lock; do
   of="$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null)/wt-owner"
   if [ -z "$who" ] && [ -f "$of" ]; then
     read -r s op t <"$of" || true
-    if [ "$s" != "$mysess" ] && [ "$op" != "$me" ] && alive_claude "$op"; then who="wt 주인 세션(pid $op, $t부터)"; fi
+    if [ "$s" != "$mysess" ] && [ "$op" != "$me" ] && alive_claude "$op"; then who="wt 주인 세션(pid $op, ${t}부터)"; fi
   fi
   [ -n "$who" ] && blocked="$blocked
   - $w: $who"

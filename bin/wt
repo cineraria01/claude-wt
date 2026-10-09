@@ -367,7 +367,7 @@ cmd_finish() {
   if has_origin; then git fetch --quiet origin "$base"; upstream="origin/$base"; fi
 
   if [ "$(git rev-list --count "$upstream..HEAD")" = 0 ]; then
-    say "$base에 새로 들어갈 커밋이 없습니다. 정리만 합니다"
+    say "${base}에 새로 들어갈 커밋이 없습니다. 정리만 합니다"
   else
     say "rebase: $branch → $upstream"
     git rebase --quiet "$upstream" || die "rebase 충돌. 이 워크트리($dir)에서 풀고 git rebase --continue → wt verify → wt finish 재실행"
