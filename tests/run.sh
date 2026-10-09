@@ -33,7 +33,7 @@ R="$T/repo"; cd "$R"
 seq 1 20 >a.txt; echo b >b.txt; echo log >log.txt
 echo 'log.txt merge=union' >.gitattributes
 mkdir .claude
-printf '#!/usr/bin/env bash\necho run >>"$VERIFY_LOG"\n' >.claude/wt-verify.sh; chmod +x .claude/wt-verify.sh
+printf '#!/usr/bin/env bash\necho run >>"$VERIFY_LOG"\neval "${VERIFY_HOOK-}"\n' >.claude/wt-verify.sh; chmod +x .claude/wt-verify.sh   # VERIFY_HOOK: 검증 중에 일어나는 일 흉내
 git add -A && git commit -qm init && git push -q -u origin main
 git remote set-head origin main
 INIT=$(git rev-parse HEAD)
@@ -156,20 +156,19 @@ check "기준이 움직인 통합 레인은 merge로 받아 성공" [ "$rc" = 0 
 check "merge 안내" has "$out" "rebase 대신 origin/main을 merge합니다"
 check "두 레인 내용 모두 main에" bash -c "git -C '$R' cat-file -e origin/main:j1.txt && git -C '$R' cat-file -e origin/main:moved.txt"
 
-echo "⑦ 멈춘 잠금 회수"
-LOCK="$(git -C "$R" rev-parse --git-common-dir)/wt-finish.lock"
-DEAD=$(bash -c 'echo $$')   # 이미 끝난 프로세스의 pid
-mkdir "$LOCK"; echo "$DEAD" >"$LOCK/pid"
+echo "⑦ 머지 잠금(flock): 쥔 쪽이 살아 있으면 기다리고, 죽으면 바로 풀림"
+LOCK="$(cd "$(git -C "$R" rev-parse --git-common-dir)" && pwd -P)/wt-merge.lock"
+hold() { ( exec 9>>"$LOCK"; python3 -I -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'; echo holder >"$LOCK"; exec sleep "$1" ) & }
+hold 300; H=$!; sleep 0.5; kill -9 "$H"; wait "$H" 2>/dev/null || true
 K=$(start after-crash); echo k >"$K/k.txt"; commit "$K" "after crash"
 rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
-check "죽은 pid의 잠금을 회수하고 finish 성공" [ "$rc" = 0 ]
-check "회수 안내" has "$out" "멈춘 잠금을 회수합니다(쥐고 있던 pid $DEAD"
-check "finish 뒤 잠금 없음" [ ! -e "$LOCK" ]
-mkdir "$LOCK"; sleep 2 & echo $! >"$LOCK/pid"   # 살아 있는 쥔 쪽: 끝날 때까지 기다린 뒤 진행
+check "강제 종료된 쪽의 잠금은 기다리지 않고 finish 성공" bash -c "[ $rc = 0 ]"
+check "대기 안내 없음" hasnt "$out" "기다립니다"
 K=$(start after-wait); echo k2 >"$K/k2.txt"; commit "$K" "after wait"
-t0=$(date +%s); rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
-check "살아 있는 동안 기다렸다가 성공" bash -c "[ $rc = 0 ] && [ $(( $(date +%s) - t0 )) -ge 1 ]"
-check "대기 안내" has "$out" "가 진행 중이라 기다립니다"
+hold 3; sleep 0.5
+rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
+check "살아 있는 동안 기다렸다가 성공" bash -c "[ $rc = 0 ]"
+check "대기 안내" has "$out" "다른 finish·train(pid holder)이 머지 중이라 기다립니다"
 
 echo "⑧ wt train: 쌓기·충돌 레인 빼기·검증 한 번·레인별 커밋"
 git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
@@ -178,9 +177,12 @@ T2=$(start t2); sed -i.bak '10s/.*/T2/' "$T2/a.txt"; rm "$T2/a.txt.bak"; commit 
 (cd "$T2" && echo t2b >t2.txt && git add -A && git commit -qm "t2: 둘째 커밋")
 T3=$(start t3); sed -i.bak '10s/.*/T3/' "$T3/a.txt"; rm "$T3/a.txt.bak"; commit "$T3" "t3: 같은 줄"
 T4=$(start t4)   # 커밋 없는 레인
+git -C "$R" tag wt/t1 "$BEFORE"        # 레인과 같은 이름의 태그(기준에 있는 커밋): 태그를 머지하면 안 됨
+git -C "$R" config merge.ff false      # --squash와 같이 못 쓰는 설정
 runs=$(verify_runs)
-rc=0; out=$("$WT" train t1 wt/t2 "$T3" t4 2>&1) || rc=$?
-check "train 성공" [ "$rc" = 0 ]
+rc=0; out=$(cd "$T1" && "$WT" train t1 ../t2 "$T3" t4 2>&1) || rc=$?   # 레인 안에서 상대 경로로 줘도 됨
+git -C "$R" tag -d wt/t1 >/dev/null; git -C "$R" config --unset merge.ff
+check "충돌로 뺀 레인이 있으면 종료 코드 2" [ "$rc" = 2 ]
 check "검증은 한 번" [ "$(verify_runs)" = $((runs + 1)) ]
 check "t1·t2 내용이 main에" bash -c "git -C '$R' cat-file -e origin/main:t1.txt && git -C '$R' cat-file -e origin/main:t2.txt && [ \"\$(git -C '$R' show origin/main:a.txt | sed -n 10p)\" = T2 ]"
 check "레인마다 커밋 하나(2개)" [ "$(git -C "$R" rev-list --count "$BEFORE..origin/main")" = 2 ]
@@ -194,20 +196,81 @@ rc=0; out=$(cd "$T3" && "$WT" finish 2>&1) || rc=$?
 check "남은 충돌 레인은 finish에서 rebase 충돌" has "$out" "rebase 충돌"
 (cd "$T3" && git rebase --abort)
 
-echo "⑨ wt train: 묶음 검증 실패면 아무것도 머지 안 함, 기준이 다르면 거절"
+echo "⑨ wt train: 거절·실패하면 아무것도 머지 안 함"
 git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
 U1=$(start u1); echo u1 >"$U1/u1.txt"; commit "$U1" "u1"
 U2=$(start u2); printf '#!/usr/bin/env bash\nexit 1\n' >"$U2/.claude/wt-verify.sh"; commit "$U2" "u2: 검증 깨짐"
 rc=0; out=$("$WT" train u1 u2 2>&1) || rc=$?
-check "검증 실패면 train 실패" [ "$rc" != 0 ]
+check "검증 실패면 train 실패" [ "$rc" = 1 ]
 check "실패 안내" has "$out" "묶음 검증 실패. 아무것도 머지하지 않았습니다"
 git -C "$R" fetch -q origin
 check "main 그대로" [ "$(git -C "$R" rev-parse origin/main)" = "$BEFORE" ]
 check "레인 둘 다 남음" bash -c "[ -d '$U1' ] && [ -d '$U2' ]"
-check "실패해도 통합 워크트리·잠금 정리" bash -c "! git -C '$R' worktree list | grep -F .train- >/dev/null && [ ! -e '$LOCK' ]"
-rc=0; out=$("$WT" train u1 v2-empty 2>&1) || rc=$?
-check "기준이 다른 레인 섞으면 거절" has "$out" "기준이 다른 레인은 함께 묶지 못합니다"
+check "실패해도 통합 워크트리 정리" bash -c "! git -C '$R' worktree list | grep -F .train- >/dev/null"
+check "기준이 다른 레인 섞으면 거절" has "$("$WT" train u1 v2-empty 2>&1 || true)" "기준이 다른 레인은 함께 묶지 못합니다"
 check "다른 세션 레인은 거절" has "$("$WT" train u1 owned 2>&1 || true)" "다른 세션이 쓰는 워크트리입니다"
+git -C "$R" worktree add -q "$T/v2-checkout" v2
+check "기준 브랜치(v2) 워크트리는 거절" has "$("$WT" train v2 2>&1 || true)" "기준 브랜치는 레인으로 묶지 않습니다: v2"
+check "v2 원격 그대로" git -C "$R" show-ref --verify --quiet refs/remotes/origin/v2
+git -C "$R" worktree remove "$T/v2-checkout"
+git -C "$R" worktree lock --reason manual "$U1"
+check "git worktree lock(에이전트 외 사유) 레인은 거절" has "$("$WT" train u1 2>&1 || true)" "잠긴 워크트리입니다"
+git -C "$R" worktree unlock "$U1"
+
+echo "⑩ wt train: 검증 중 레인에 생긴 변경은 지우지 않음"
+W1=$(start w1); echo w1 >"$W1/w1.txt"; commit "$W1" "w1"
+W2=$(start w2); echo w2 >"$W2/w2.txt"; commit "$W2" "w2"
+rc=0; out=$(VERIFY_HOOK="(cd '$W1' && echo late >late.txt && git add -A && git commit -qm late); echo dirty >>'$W2/w2.txt'" "$WT" train w1 w2 2>&1) || rc=$?
+check "남긴 레인이 있으면 종료 코드 2" [ "$rc" = 2 ]
+check "쌓은 내용은 main에" bash -c "git -C '$R' cat-file -e origin/main:w1.txt && git -C '$R' cat-file -e origin/main:w2.txt"
+check "늦은 커밋은 아직 main에 없음" bash -c "! git -C '$R' cat-file -e origin/main:late.txt 2>/dev/null"
+check "두 레인 모두 남음(커밋·미커밋 보존)" bash -c "[ -f '$W1/late.txt' ] && grep -q dirty '$W2/w2.txt'"
+check "남긴 레인 안내" has "$out" "쌓은 뒤 새 커밋·미커밋 변경이 생겨 남긴 레인"
+
+echo "⑪ gc: 강제 종료로 남은 train 통합 워크트리"
+DEAD=$(bash -c 'echo $$')
+git -C "$R" worktree add -q --detach "$R.wt/.train-$DEAD" origin/main
+check "끝난 pid의 .train- 워크트리 정리" has "$("$WT" gc --apply 2>&1)" "정리 대상(끝난 train의 통합 워크트리) $R.wt/.train-$DEAD"
+check "실제로 지워짐" [ ! -e "$R.wt/.train-$DEAD" ]
+
+echo "⑫ wt train: GitHub 경로(gh 흉내, 원격 주소에 github.com)"
+G="$T/github.com/gh.git"; GS="$T/ghstate"; mkdir -p "$T/github.com" "$GS"
+git clone -q --bare "$T/origin.git" "$G"
+cat >"$T/bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -eu
+echo "gh $*" >>"$GH_STATE/calls"
+case "$1 $2" in
+  "pr create") shift 2; while [ $# -gt 0 ]; do case $1 in --base) b=$2; shift 2 ;; --head) h=$2; shift 2 ;; *) shift ;; esac; done
+               echo "$b $h" >"$GH_STATE/pr"; rm -f "$GH_STATE/merged" ;;
+  "pr list") [ -f "$GH_STATE/pr" ] && [ ! -f "$GH_STATE/merged" ] && echo 7 || true ;;
+  "pr merge") [ "$4" = --rebase ] || exit 1; [ -z "${GH_FAIL_MERGE-}" ] || exit 1
+              read -r b h <"$GH_STATE/pr"; c=$(mktemp -d); git clone -q "$GH_ORIGIN" "$c"
+              (cd "$c" && git checkout -q "$h" && git rebase -q "origin/$b" && git push -q origin "HEAD:$b"); rm -rf "$c"; touch "$GH_STATE/merged" ;;
+  "pr close") read -r b h <"$GH_STATE/pr"; git --git-dir="$GH_ORIGIN" branch -D "$h" >/dev/null ;;
+  "pr view") echo MERGED ;;
+esac
+GH
+chmod +x "$T/bin/gh"
+git clone -q "$G" "$T/ghrepo" 2>/dev/null; GR="$T/ghrepo"; git -C "$GR" remote set-head origin main
+export GH_STATE="$GS" GH_ORIGIN="$G"
+gstart() { (cd "$GR" && PATH="$T/bin:$PATH" "$WT" start "$1" 2>/dev/null | tail -n 1); }
+GB=$(git -C "$GR" rev-parse origin/main)
+G1=$(gstart g1); echo 1 >"$G1/g1.txt"; commit "$G1" "g1 추가"
+G2=$(gstart g2); echo 2 >"$G2/g2.txt"; commit "$G2" "g2 추가"
+git -C "$G2" push -q origin wt/g2   # 원격에도 있던 레인 브랜치
+rc=0; out=$(cd "$GR" && PATH="$T/bin:$PATH" GH_FAIL_MERGE=1 "$WT" train g1 g2 2>&1) || rc=$?
+check "머지 실패면 train 실패" [ "$rc" = 1 ]
+check "실패한 PR을 닫음" has "$(cat "$GS/calls")" "gh pr close 7 --delete-branch"
+check "train 브랜치 원격에서 정리" bash -c "! git --git-dir='$G' for-each-ref refs/heads/wt/train- | grep . >/dev/null"
+check "레인 그대로" bash -c "[ -d '$G1' ] && [ -d '$G2' ]"
+rc=0; out=$(cd "$GR" && PATH="$T/bin:$PATH" "$WT" train --title "묶음" g1 g2 2>&1) || rc=$?
+git -C "$GR" fetch -q --prune origin
+check "GitHub 경로 train 성공" [ "$rc" = 0 ]
+check "rebase 머지로 레인별 커밋 2개" [ "$(git -C "$GR" rev-list --count "$GB..origin/main")" = 2 ]
+check "PR 제목은 --title" has "$(cat "$GS/calls")" "--title 묶음"
+check "원격 레인 브랜치·train 브랜치 정리" bash -c "[ -z \"\$(git --git-dir='$G' for-each-ref --format='%(refname)' refs/heads/wt/)\" ]"
+check "메인 폴더 fast-forward" [ -f "$GR/g2.txt" ]
 
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys

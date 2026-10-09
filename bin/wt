@@ -26,13 +26,9 @@ set -euo pipefail
 die() { printf 'wt: %s\n' "$*" >&2; exit 1; }
 say() { printf '▸ %s\n' "$*" >&2; }
 
-# 끝날 때(die 포함) 이 프로세스가 쥔 머지 잠금과 train의 임시 통합 워크트리를 치운다.
-WT_LOCK="" WT_TMP_WT="" WT_ROOT=""
-on_exit() {
-  [ -n "$WT_TMP_WT" ] && { git -C "$WT_ROOT" worktree remove --force "$WT_TMP_WT" 2>/dev/null || true; }
-  [ -n "$WT_LOCK" ] && [ "$(cat "$WT_LOCK/pid" 2>/dev/null)" = $$ ] && { rm -f "$WT_LOCK/pid"; rmdir "$WT_LOCK" 2>/dev/null || true; }
-  return 0
-}
+# 끝날 때(die 포함) train의 임시 통합 워크트리를 치운다. 머지 잠금은 프로세스가 끝나면 OS가 푼다(take_lock).
+WT_TMP_WT="" WT_ROOT=""
+on_exit() { [ -z "$WT_TMP_WT" ] || git -C "$WT_ROOT" worktree remove --force "$WT_TMP_WT" 2>/dev/null || true; }
 trap on_exit EXIT
 
 git_common_dir() { (cd "$(git rev-parse --git-common-dir)" && pwd -P); }
@@ -270,11 +266,11 @@ prepare_worktree() {
     (cd "$root" && git ls-files --others --ignored --exclude-from="$root/.worktreeinclude" --directory) \
       | while IFS= read -r f; do
           f=${f%/}; mkdir -p "$dir/$(dirname "$f")"; cp -R "$root/$f" "$dir/$f"
-        done
+        done || return 1   # || 문맥에서 불려 함수 안 errexit가 꺼지므로 직접 확인
   fi
   if [ -x "$dir/.claude/wt-setup.sh" ]; then
     say "준비 스크립트 실행: .claude/wt-setup.sh"
-    (cd "$dir" && WT_MAIN="$root" ./.claude/wt-setup.sh) || return 1
+    (cd "$dir" && WT_MAIN="$root" ./.claude/wt-setup.sh 9>&-) || return 1
   fi
 }
 
@@ -332,7 +328,7 @@ squash_message() {
 verified_file() { echo "$(git rev-parse --absolute-git-dir)/wt-verified"; }
 run_verify() {
   say "검증 스크립트 실행: .claude/wt-verify.sh"
-  ./.claude/wt-verify.sh || return 1
+  ./.claude/wt-verify.sh 9>&- || return 1
   git rev-parse 'HEAD^{tree}' >"$(verified_file)"
 }
 cmd_verify() {
@@ -345,25 +341,22 @@ cmd_verify() {
   say "검증 통과(트리 $(git rev-parse --short 'HEAD^{tree}')). rebase 뒤에도 코드가 같으면 wt finish가 검증을 건너뜁니다"
 }
 
-# 동시에 끝나는 작업끼리 머지를 한 줄로 세운다(finish·train 공용). 잠금 폴더에 쥔 프로세스 pid를 남겨,
-# 그 프로세스가 살아 있는 동안은 얼마든 기다리고, 죽었으면(강제 종료로 정리를 못 한 경우) 잠금을 회수한다.
+# 동시에 끝나는 작업끼리 머지를 한 줄로 세운다(finish·train 공용). <git-common-dir>/wt-merge.lock 에 flock을
+# 이 셸의 fd 9로 건다. 어떻게 끝나든(강제 종료 포함) OS가 풀어 주므로 멈춘 잠금이 남지 않고, 쥔 쪽이 살아 있는 동안은
+# 얼마든 기다린다. 오래 살 수 있는 자식(검증·준비 스크립트)에는 fd 9를 넘기지 않는다(9>&-). 파일 내용은 안내용 pid뿐.
 take_lock() {
-  WT_LOCK="$(git_common_dir)/wt-finish.lock"
-  local waited=0 holder
-  until mkdir "$WT_LOCK" 2>/dev/null; do
-    holder=$(cat "$WT_LOCK/pid" 2>/dev/null || true)
-    # ponytail: 읽기와 회수 사이에 다른 대기자가 먼저 회수하면 겹칠 수 있다. 직전에 pid를 다시 읽어 창을 좁힌다.
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null && [ "$(cat "$WT_LOCK/pid" 2>/dev/null)" = "$holder" ]; then
-      say "멈춘 잠금을 회수합니다(쥐고 있던 pid $holder 종료됨)"
-      rm -f "$WT_LOCK/pid"; rmdir "$WT_LOCK" 2>/dev/null || true
-      continue
-    fi
-    # pid가 없는 잠금(옛 wt가 잡은 것)만 예전처럼 10분 뒤 포기한다.
-    [ -z "$holder" ] && [ $waited -gt 600 ] && die "잠금 대기 10분 초과. 멈춘 잠금이면 삭제: rm -r $WT_LOCK"
-    [ $((waited % 60)) = 0 ] && say "다른 finish(pid ${holder:-?})가 진행 중이라 기다립니다($((waited / 60))분 경과, $WT_LOCK)"
+  local f waited=0 rc; f="$(git_common_dir)/wt-merge.lock"
+  exec 9>>"$f"
+  while :; do
+    rc=0; python3 -I -c 'import fcntl, sys
+try: fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError: sys.exit(1)' || rc=$?
+    [ $rc = 0 ] && break
+    [ $rc = 1 ] || die "머지 잠금을 걸지 못했습니다(python3 필요, 종료 코드 $rc)"
+    [ $((waited % 60)) = 0 ] && say "다른 finish·train(pid $(cat "$f" 2>/dev/null))이 머지 중이라 기다립니다($((waited / 60))분 경과)"
     waited=$((waited + 1)); sleep 1
   done
-  echo $$ >"$WT_LOCK/pid"
+  echo $$ >"$f"
 }
 
 # GitHub 밖(원격 없음 포함): 로컬 base를 rev로 fast-forward. 그 브랜치를 쥔 워크트리가 있으면 거기서.
@@ -381,10 +374,11 @@ ff_base() {
 # 머지가 끝난 레인의 워크트리·로컬 브랜치를 지운다.
 # Agent(isolation: "worktree")가 만든 워크트리는 "claude agent ..." 사유로 잠겨 있다.
 # 머지까지 끝났다는 건 작업이 끝났다는 뜻이므로 그 잠금만 푼다(다른 사유 잠금은 그대로 실패).
+# git worktree lock 사유. 안 잠겼으면 빈 문자열, 사유 없이 잠겼으면 "-".
+lock_reason() { git worktree list --porcelain | awk -v w="worktree $1" '$0==w{f=1;next} /^worktree /{f=0} f&&/^locked/&&!d{sub(/^locked ?/,""); print ($0=="" ? "-" : $0); d=1}'; }
 remove_lane() {
-  local dir=$1 branch=$2 lock_reason
-  lock_reason=$(git worktree list --porcelain | awk -v w="worktree $dir" '$0==w{f=1;next} /^worktree /{f=0} f&&/^locked/&&!d{sub(/^locked ?/,"");print;d=1}')
-  case "$lock_reason" in
+  local dir=$1 branch=$2
+  case "$(lock_reason "$dir")" in
     "claude agent"*) git worktree unlock "$dir" ;;
   esac
   git worktree remove --force "$dir"
@@ -494,8 +488,9 @@ cmd_finish() {
 }
 
 # 여러 레인을 한 번에: 잠금 한 번 → origin/<기준>의 임시 통합 워크트리에 레인마다 squash 커밋 하나씩 쌓기
-# (충돌 나는 레인은 빼고 계속) → .claude/wt-verify.sh 한 번 → 한 번에 머지(레인별 커밋 유지) → 레인 정리.
+# (충돌 나는 레인은 빼고 계속) → 준비·.claude/wt-verify.sh 한 번 → 한 번에 머지(레인별 커밋 유지) → 레인 정리.
 # 검증이 실패하면 아무것도 머지하지 않는다. 그때는 레인마다 wt finish(각자 rebase·검증).
+# 종료 코드: 0 = 모두 머지·정리, 2 = 충돌로 뺐거나 쌓은 뒤 바뀌어 남긴 레인이 있음.
 cmd_train() {
   local title="" args=()
   while [ $# -gt 0 ]; do
@@ -507,15 +502,18 @@ cmd_train() {
   done
   [ ${#args[@]} -gt 0 ] || die "사용법: wt train [--title <제목>] <레인>...  (레인 = 슬러그·브랜치·워크트리 경로)"
   git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
-  local root; root=$(main_root); cd "$root"
+  local here=$PWD root common; root=$(main_root); common=$(git_common_dir); cd "$root"
 
   # 레인 확인은 잠금 전에 끝낸다: 하나라도 안 되면 아무것도 하지 않는다.
-  local dirs=() branches=() base="" a b d gd lb st
+  local dirs=() branches=() base="" a b d p gd lb st
   for a in "${args[@]}"; do
     if git show-ref --verify --quiet "refs/heads/wt/$a"; then b="wt/$a"
     elif git show-ref --verify --quiet "refs/heads/$a"; then b=$a
-    elif [ -d "$a" ]; then b=$(git -C "$a" symbolic-ref --quiet --short HEAD) || die "브랜치가 없는 워크트리입니다: $a"
+    elif p=$(cd "$here" && cd "$a" 2>/dev/null && pwd -P); then
+      [ "$(cd "$p" && git_common_dir 2>/dev/null)" = "$common" ] || die "이 저장소의 워크트리가 아닙니다: $a"
+      b=$(git -C "$p" symbolic-ref --quiet --short HEAD) || die "브랜치가 없는 워크트리입니다: $a"
     else die "레인을 찾지 못했습니다: $a"; fi
+    is_base_branch "$b" && die "기준 브랜치는 레인으로 묶지 않습니다: $b"
     case " ${branches[*]-} " in *" $b "*) die "같은 레인을 두 번 넣었습니다: $b" ;; esac
     d=$(git worktree list --porcelain | awk -v r="branch refs/heads/$b" '/^worktree /{w=substr($0,10)} $0==r{print w}')
     [ -n "$d" ] || die "워크트리가 없는 브랜치입니다: $b"
@@ -526,6 +524,7 @@ cmd_train() {
     st=$(owner_state "$d")
     case $st in other*) [ "${WT_FORCE_FINISH:-}" = 1 ] || die "다른 세션이 쓰는 워크트리입니다$(owner_label "$st"): $d" ;; esac
     case $(agent_lock_state "$d") in other*) die "다른 세션 에이전트가 쓰는 워크트리입니다: $d" ;; esac
+    case $(lock_reason "$d") in ""|"claude agent"*) ;; *) die "잠긴 워크트리입니다(git worktree lock): $d" ;; esac
     lb=$(lane_base "$b"); [ -n "$base" ] || base=$lb
     [ "$lb" = "$base" ] || die "기준이 다른 레인은 함께 묶지 못합니다: $b(기준 $lb) ≠ 기준 $base"
     dirs+=("$d"); branches+=("$b")
@@ -536,31 +535,36 @@ cmd_train() {
   if has_origin; then git fetch --quiet origin "$base"; upstream="origin/$base"; fi
   WT_ROOT=$root WT_TMP_WT="$(dirname "$root")/$(basename "$root").wt/.train-$$"
   git worktree add --quiet --detach "$WT_TMP_WT" "$upstream"
-  prepare_worktree "$root" "$WT_TMP_WT" || die "준비 스크립트 실패(통합 워크트리). 아무것도 머지하지 않았습니다"
 
-  # 쌓은 레인·이미 들어 있던 레인·충돌로 뺀 레인(배열 번호, 공백 구분)
-  local i stacked="" already="" conflicted=""
+  # 레인은 이름이 아니라 지금의 커밋으로 쌓는다(같은 이름 태그·쌓은 뒤 새 커밋과 섞이지 않게). 목록은 배열 번호, 공백 구분.
+  local i rc out tips=() stacked="" already="" conflicted=""
   for i in "${!branches[@]}"; do
     b=${branches[$i]}
-    if ! git -C "$WT_TMP_WT" merge --squash "$b" >/dev/null 2>&1; then
+    tips[$i]=$(git rev-parse --verify --quiet "refs/heads/$b") || { say "그사이 사라진 레인: $b"; continue; }
+    rc=0; out=$(git -C "$WT_TMP_WT" -c merge.ff=true merge --squash "${tips[$i]}" 2>&1) || rc=$?
+    if [ $rc != 0 ]; then
+      [ -n "$(git -C "$WT_TMP_WT" diff --name-only --diff-filter=U)" ] || die "$b 를 쌓지 못했습니다. 아무것도 머지하지 않았습니다: $out"
       git -C "$WT_TMP_WT" reset --quiet --hard
       conflicted+=" $i"; say "충돌로 뺌: $b"; continue
     fi
     if git -C "$WT_TMP_WT" diff --cached --quiet; then
       already+=" $i"; say "이미 ${base}에 들어 있음: $b"; continue
     fi
-    git -C "$WT_TMP_WT" commit --quiet -F - <<<"$(squash_message "$upstream" "" "$b")"
+    git -C "$WT_TMP_WT" commit --quiet -F - <<<"$(squash_message "$upstream" "" "${tips[$i]}")"
     stacked+=" $i"; say "쌓음: $b"
   done
 
+  local names=""
   if [ -z "$stacked" ]; then
     say "${base}에 새로 들어갈 레인이 없습니다"
   else
+    # 준비 스크립트는 쌓은 뒤에 돌린다(의존성을 바꾼 레인도 그 의존성으로 검증되게).
+    prepare_worktree "$root" "$WT_TMP_WT" || die "준비 스크립트 실패(통합 워크트리). 아무것도 머지하지 않았습니다"
     if [ -x "$WT_TMP_WT/.claude/wt-verify.sh" ]; then
       (cd "$WT_TMP_WT" && run_verify) \
         || die "묶음 검증 실패. 아무것도 머지하지 않았습니다. 레인마다 wt finish로 각자 검증·머지하세요"
     fi
-    local tip names=""; tip=$(git -C "$WT_TMP_WT" rev-parse HEAD)
+    local tip; tip=$(git -C "$WT_TMP_WT" rev-parse HEAD)
     for i in $stacked; do names+=" ${branches[$i]#wt/}"; done
     if is_github && command -v gh >/dev/null; then
       local tb subject body pr state
@@ -570,11 +574,14 @@ cmd_train() {
       say "push → origin/$tb"
       git push --quiet origin "$tip:refs/heads/$tb"
       gh pr create --base "$base" --head "$tb" --title "$subject" \
-        --body "$(printf '%s\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' "$body")" >/dev/null
+        --body "$(printf '%s\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' "$body")" >/dev/null \
+        || { git push --quiet origin --delete "$tb" 2>/dev/null || true; die "PR을 만들지 못했습니다. 레인은 그대로입니다"; }
       pr=$(gh pr list --head "$tb" --base "$base" --state open --json number --jq '.[0].number')
       say "PR #$pr rebase 머지(레인마다 커밋 하나)"
-      gh pr merge "$pr" --rebase \
-        || die "머지 실패(rebase 머지 허용 여부·보호 규칙·체크 등). PR #$pr 을 확인하세요. 레인 워크트리는 남겨 둠"
+      if ! gh pr merge "$pr" --rebase; then
+        gh pr close "$pr" --delete-branch >/dev/null 2>&1 || true
+        die "머지 실패(rebase 머지 허용 여부·보호 규칙·체크 등). PR #$pr 은 닫았습니다. 레인은 그대로 — 레인마다 wt finish"
+      fi
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 레인 워크트리는 남겨 둠"
       git push --quiet origin --delete "$tb" 2>/dev/null || true
@@ -588,17 +595,33 @@ cmd_train() {
   fi
 
   git worktree remove --force "$WT_TMP_WT"; WT_TMP_WT=""
+  has_origin && git fetch --quiet origin "$base"
+  local changed=""
   for i in $stacked $already; do
-    b=${branches[$i]}
-    remove_lane "${dirs[$i]}" "$b"
-    if has_origin && git show-ref --verify --quiet "refs/remotes/origin/$b"; then git push --quiet origin --delete "$b" 2>/dev/null || true; fi
+    b=${branches[$i]} d=${dirs[$i]}
+    # 쌓은 뒤 레인에 새 커밋·미커밋 변경이 생겼으면 지우지 않는다(그 변경은 아직 머지되지 않았다).
+    if [ "$(git rev-parse --verify --quiet "refs/heads/$b" || true)" != "${tips[$i]}" ] \
+      || [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then
+      changed+=" $i"; continue
+    fi
+    remove_lane "$d" "$b"
+    # 원격 레인 브랜치는 내용이 기준에 다 들어 있을 때만 지운다(다른 곳에서 더 push했을 수 있다).
+    if has_origin && git show-ref --verify --quiet "refs/remotes/origin/$b" && content_in_base "$upstream" "origin/$b"; then
+      git push --quiet origin --delete "$b" 2>/dev/null || true
+    fi
   done
   sync_main "$root" "$base"
+  say "정리 완료: 머지${names:- 없음}, 메인 폴더 $root"
+  [ -n "$conflicted$changed" ] || return 0
   if [ -n "$conflicted" ]; then
-    say "충돌로 남긴 레인(그 워크트리에서 wt finish → rebase 충돌을 풀고 각자 머지):"
+    say "충돌로 뺀 레인(그 워크트리에서 wt finish → rebase 충돌을 풀고 각자 머지):"
     for i in $conflicted; do printf '  %s  %s\n' "${dirs[$i]}" "${branches[$i]}" >&2; done
   fi
-  say "정리 완료: 머지$([ -n "$stacked" ] && echo "$names" || echo " 없음"), 메인 폴더 $root"
+  if [ -n "$changed" ]; then
+    say "쌓은 뒤 새 커밋·미커밋 변경이 생겨 남긴 레인(쌓은 부분은 들어갔음, 남은 변경은 그 워크트리에서 wt finish):"
+    for i in $changed; do printf '  %s  %s\n' "${dirs[$i]}" "${branches[$i]}" >&2; done
+  fi
+  exit 2
 }
 
 # list 한 줄의 꼬리: 자기 기준 대비 앞선 커밋 수, [기준 X](기본 브랜치가 아닐 때), [X에 반영됨]/[오래됨]/[기준 브랜치].
@@ -653,6 +676,14 @@ cmd_gc() {
   local n=0
   while IFS=$'\t' read -r w b; do
     [ "$w" = "$root" ] && continue
+    # 강제 종료로 남은 train 통합 워크트리(<저장소>.wt/.train-<pid>, detached): 그 pid가 끝났으면 지운다.
+    case $w in
+      "$(dirname "$root")/$(basename "$root").wt/.train-"*)
+        kill -0 "${w##*.train-}" 2>/dev/null && continue
+        n=$((n + 1)); printf '  정리 대상(끝난 train의 통합 워크트리) %s\n' "$w"
+        [ $apply = 1 ] && git worktree remove --force "$w"
+        continue ;;
+    esac
     [ -n "$b" ] || continue
     [ -z "$(git -C "$w" status --porcelain 2>/dev/null)" ] || { printf '  유지(미커밋 변경) %s\n' "$w"; continue; }
     is_base_branch "$b" && { printf '  유지(기준 브랜치) %s  %s\n' "$w" "$b"; continue; }
@@ -666,7 +697,7 @@ cmd_gc() {
     content_in_base "$(base_ref "$(lane_base "$b")")" "$b" || { printf '  유지(미반영 커밋) %s  %s\n' "$w" "$b"; continue; }
     n=$((n + 1)); printf '  정리 대상 워크트리 %s  %s\n' "$w" "$b"
     if [ $apply = 1 ]; then git worktree remove --force "$w"; git branch -D "$b" >/dev/null; fi
-  done < <(git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w"\t"substr($0,19)}')
+  done < <(git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w"\t"substr($0,19)} /^detached/{print w"\t"}')
   while read -r b; do
     [ "$b" = "$base" ] && continue
     git worktree list --porcelain | grep -x "branch refs/heads/$b" >/dev/null && continue
