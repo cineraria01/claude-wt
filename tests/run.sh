@@ -131,6 +131,18 @@ check "다른 세션 레인 finish 거절" bash -c "cd '$O' && ! '$WT' finish 2>
 check "gc가 다른 세션 레인 유지" has "$("$WT" gc --apply 2>&1)" "유지(다른 세션 사용 중) $O"
 check "레인 남아 있음" [ -d "$O" ]
 
+# 커밋 없는 finish(정리만). 변수 바로 뒤에 한글이 붙으면 bash가 한글 바이트까지 변수 이름으로 읽어
+# set -u에서 멈춘다(en_US.UTF-8 등). 변수는 ${이름}으로 감싸야 한다.
+E=$(start empty-finish)
+rc=0; out=$(cd "$E" && LC_ALL=en_US.UTF-8 "$WT" finish 2>&1) || rc=$?
+check "커밋 없는 finish가 정리만 하고 성공" [ "$rc" = 0 ]
+check "정리만 안내" has "$out" "새로 들어갈 커밋이 없습니다"
+check "빈 레인 정리됨" [ ! -e "$E" ]
+ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
+check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
+bad=[f"{p}:{i}" for p in sys.argv[1:] for i,l in enumerate(open(p,encoding="utf-8"),1) if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[\uac00-\ud7a3]",l)]
+print(*bad,sep="\n"); sys.exit(1 if bad else 0)' "$WT" "$ROOT"/hooks/* "$ROOT"/install.sh "$ROOT"/uninstall.sh
+
 bash -n "$WT"
 echo "결과: 통과 $pass, 실패 $fail"
 [ "$fail" = 0 ]
