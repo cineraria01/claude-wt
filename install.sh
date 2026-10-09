@@ -36,8 +36,9 @@ mkdir -p "$CLAUDE_DIR/bin" "$CLAUDE_DIR/hooks"
 for f in bin/wt hooks/wt-main-guard hooks/wt-remove-guard hooks/wt-session-status; do
   dst="$CLAUDE_DIR/$f"
   [ -f "$dst" ] && ! cmp -s "$src/$f" "$dst" && cp "$dst" "$dst.bak-$ts"
-  cp "$src/$f" "$dst"
-  chmod +x "$dst"
+  # 실행 중인 wt가 읽던 파일을 제자리에서 덮지 않게 새 파일로 바꿔 끼운다.
+  cp "$src/$f" "$dst.new.$$" && chmod +x "$dst.new.$$" && mv -f "$dst.new.$$" "$dst" \
+    || { echo "claude-wt: 설치 실패 $dst" >&2; rm -f "$dst.new.$$"; exit 1; }
 done
 echo "설치: ~/.claude/bin/wt, ~/.claude/hooks/wt-{main-guard,remove-guard,session-status}"
 
