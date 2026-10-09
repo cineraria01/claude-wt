@@ -115,6 +115,13 @@ out=$(cd "$C" && "$WT" finish 2>&1) || true
 check "finish 시작 때 한 줄 요약" has "$out" "겹치지만 자동 병합 가능"
 
 echo "⑤ 기존 동작 회귀"
+# .worktreeinclude 복사가 중간에서 실패하면(뒤 파일은 성공해도) start가 실패해야 한다.
+printf 'aa.secret\nzz.secret\n' >"$R/.worktreeinclude"; printf 'aa.secret\nzz.secret\n.worktreeinclude\n' >"$R/.git/info/exclude"
+mkdir "$R/aa.secret"; : >"$R/aa.secret/x"; chmod 000 "$R/aa.secret"; : >"$R/zz.secret"
+rc=0; "$WT" start include-fail >/dev/null 2>&1 || rc=$?
+chmod 755 "$R/aa.secret"; rm -rf "$R/aa.secret" "$R/zz.secret" "$R/.worktreeinclude"; : >"$R/.git/info/exclude"
+check ".worktreeinclude 복사가 중간에서 실패하면 start 실패" [ "$rc" != 0 ]
+"$WT" gc --apply >/dev/null 2>&1 || true; git -C "$R" worktree remove --force "$R.wt/include-fail" 2>/dev/null || true; git -C "$R" branch -D wt/include-fail >/dev/null 2>&1 || true
 M=$(start plain)
 echo new >"$M/g.txt"
 check "미커밋이면 finish 거절" bash -c "cd '$M' && ! '$WT' finish 2>/dev/null"
@@ -169,6 +176,16 @@ hold 3; sleep 0.5
 rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
 check "살아 있는 동안 기다렸다가 성공" bash -c "[ $rc = 0 ]"
 check "대기 안내" has "$out" "다른 finish·train(pid holder)이 머지 중이라 기다립니다"
+# git이 띄운 오래 사는 프로세스(fsmonitor 훅의 백그라운드 등)가 잠금 fd를 물려받으면 끝난 뒤에도 잠금이 남았다.
+printf '#!/usr/bin/env bash\nsleep 4 </dev/null >/dev/null 2>&1 &\nexit 1\n' >"$T/fsmon.sh"; chmod +x "$T/fsmon.sh"
+git -C "$R" config core.fsmonitor "$T/fsmon.sh"
+K=$(start fd-leak); echo k3 >"$K/k3.txt"; commit "$K" "fd leak"
+(cd "$K" && "$WT" finish >/dev/null 2>&1)
+K=$(start fd-leak2); echo k4 >"$K/k4.txt"; commit "$K" "fd leak 2"
+rc=0; out=$(cd "$K" && "$WT" finish 2>&1) || rc=$?
+git -C "$R" config --unset core.fsmonitor
+check "git 자식 프로세스가 잠금을 물려받지 않음(바로 다음 finish가 안 기다림)" bash -c "[ $rc = 0 ]" 
+check "  └ 대기 안내 없음" hasnt "$out" "기다립니다"
 
 echo "⑧ wt train: 쌓기·충돌 레인 빼기·검증 한 번·레인별 커밋"
 git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
@@ -182,7 +199,7 @@ git -C "$R" config merge.ff false      # --squash와 같이 못 쓰는 설정
 runs=$(verify_runs)
 rc=0; out=$(cd "$T1" && "$WT" train t1 ../t2 "$T3" t4 2>&1) || rc=$?   # 레인 안에서 상대 경로로 줘도 됨
 git -C "$R" tag -d wt/t1 >/dev/null; git -C "$R" config --unset merge.ff
-check "충돌로 뺀 레인이 있으면 종료 코드 2" [ "$rc" = 2 ]
+check "충돌로 뺀 레인이 있으면 종료 코드 3" [ "$rc" = 3 ]
 check "검증은 한 번" [ "$(verify_runs)" = $((runs + 1)) ]
 check "t1·t2 내용이 main에" bash -c "git -C '$R' cat-file -e origin/main:t1.txt && git -C '$R' cat-file -e origin/main:t2.txt && [ \"\$(git -C '$R' show origin/main:a.txt | sed -n 10p)\" = T2 ]"
 check "레인마다 커밋 하나(2개)" [ "$(git -C "$R" rev-list --count "$BEFORE..origin/main")" = 2 ]
@@ -210,7 +227,7 @@ check "실패해도 통합 워크트리 정리" bash -c "! git -C '$R' worktree 
 check "기준이 다른 레인 섞으면 거절" has "$("$WT" train u1 v2-empty 2>&1 || true)" "기준이 다른 레인은 함께 묶지 못합니다"
 check "다른 세션 레인은 거절" has "$("$WT" train u1 owned 2>&1 || true)" "다른 세션이 쓰는 워크트리입니다"
 git -C "$R" worktree add -q "$T/v2-checkout" v2
-check "기준 브랜치(v2) 워크트리는 거절" has "$("$WT" train v2 2>&1 || true)" "기준 브랜치는 레인으로 묶지 않습니다: v2"
+check "기준 브랜치(v2) 워크트리는 거절" has "$("$WT" train v2 2>&1 || true)" "원격 사본이 로컬보다 앞선 브랜치라 묶지 않습니다: v2"
 check "v2 원격 그대로" git -C "$R" show-ref --verify --quiet refs/remotes/origin/v2
 git -C "$R" worktree remove "$T/v2-checkout"
 git -C "$R" worktree lock --reason manual "$U1"
@@ -221,7 +238,7 @@ echo "⑩ wt train: 검증 중 레인에 생긴 변경은 지우지 않음"
 W1=$(start w1); echo w1 >"$W1/w1.txt"; commit "$W1" "w1"
 W2=$(start w2); echo w2 >"$W2/w2.txt"; commit "$W2" "w2"
 rc=0; out=$(VERIFY_HOOK="(cd '$W1' && echo late >late.txt && git add -A && git commit -qm late); echo dirty >>'$W2/w2.txt'" "$WT" train w1 w2 2>&1) || rc=$?
-check "남긴 레인이 있으면 종료 코드 2" [ "$rc" = 2 ]
+check "남긴 레인이 있으면 종료 코드 3" [ "$rc" = 3 ]
 check "쌓은 내용은 main에" bash -c "git -C '$R' cat-file -e origin/main:w1.txt && git -C '$R' cat-file -e origin/main:w2.txt"
 check "늦은 커밋은 아직 main에 없음" bash -c "! git -C '$R' cat-file -e origin/main:late.txt 2>/dev/null"
 check "두 레인 모두 남음(커밋·미커밋 보존)" bash -c "[ -f '$W1/late.txt' ] && grep -q dirty '$W2/w2.txt'"
@@ -242,7 +259,7 @@ set -eu
 echo "gh $*" >>"$GH_STATE/calls"
 case "$1 $2" in
   "pr create") shift 2; while [ $# -gt 0 ]; do case $1 in --base) b=$2; shift 2 ;; --head) h=$2; shift 2 ;; *) shift ;; esac; done
-               echo "$b $h" >"$GH_STATE/pr"; rm -f "$GH_STATE/merged" ;;
+               echo "$b $h" >"$GH_STATE/pr"; rm -f "$GH_STATE/merged"; echo "https://github.com/o/r/pull/7" ;;
   "pr list") [ -f "$GH_STATE/pr" ] && [ ! -f "$GH_STATE/merged" ] && echo 7 || true ;;
   "pr merge") [ "$4" = --rebase ] || exit 1; [ -z "${GH_FAIL_MERGE-}" ] || exit 1
               read -r b h <"$GH_STATE/pr"; c=$(mktemp -d); git clone -q "$GH_ORIGIN" "$c"
