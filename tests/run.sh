@@ -289,6 +289,16 @@ check "PR 제목은 --title" has "$(cat "$GS/calls")" "--title 묶음"
 check "원격 레인 브랜치·train 브랜치 정리" bash -c "[ -z \"\$(git --git-dir='$G' for-each-ref --format='%(refname)' refs/heads/wt/)\" ]"
 check "메인 폴더 fast-forward" [ -f "$GR/g2.txt" ]
 
+echo "⑦ gc의 24시간 판정은 status가 건드리는 파일을 사용 흔적으로 안 본다"
+OLD=$(start gc-old); FRESH=$(start gc-fresh)
+OGD=$(git -C "$OLD" rev-parse --absolute-git-dir)
+find "$OGD" "$OLD" -exec touch -h -t 202001010000 {} + 2>/dev/null
+git -C "$OLD" status >/dev/null; git -C "$OLD" status --porcelain >/dev/null   # gd mtime·index를 지금으로 갱신
+out=$("$WT" gc 2>&1)
+check "오래된 레인은 status 뒤에도 정리 대상" has "$out" "정리 대상 워크트리 $OLD"
+check "방금 만든 레인은 24시간 내 사용으로 유지" has "$out" "유지(24시간 내 사용) $FRESH"
+git -C "$R" worktree remove --force "$FRESH" 2>/dev/null || true; git -C "$R" branch -D wt/gc-fresh >/dev/null 2>&1 || true
+
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
 bad=[f"{p}:{i}" for p in sys.argv[1:] for i,l in enumerate(open(p,encoding="utf-8"),1) if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[\uac00-\ud7a3]",l)]

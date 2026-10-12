@@ -696,8 +696,9 @@ cmd_gc() {
     case $(owner_state "$w") in other*) printf '  유지(다른 세션 사용 중) %s  %s\n' "$w" "$b"; continue ;; esac
     case $(agent_lock_state "$w") in other*) printf '  유지(다른 세션 에이전트 잠금) %s  %s\n' "$w" "$b"; continue ;; esac
     # 방금 만든 워크트리는 커밋이 없어도 main과 같아 보인다. 다른 세션 것일 수 있으니 하루 동안은 건드리지 않는다.
+    # 시작점 자체(status가 index.lock을 만들고 지우며 $gd mtime을 갱신한다)와 index(status가 다시 쓴다)는 사용 흔적이 아니라 뺀다.
     local gd; gd=$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null)
-    if [ -n "$gd" ] && [ -n "$(find "$gd" "$w" -maxdepth 1 -mmin -1440 2>/dev/null | sed -n 1p)" ]; then
+    if [ -n "$gd" ] && [ -n "$(find "$gd" "$w" -mindepth 1 -maxdepth 1 ! -name index ! -name index.lock -mmin -1440 2>/dev/null | sed -n 1p)" ]; then
       printf '  유지(24시간 내 사용) %s  %s\n' "$w" "$b"; continue
     fi
     content_in_base "$(base_ref "$(lane_base "$b")")" "$b" || { printf '  유지(미반영 커밋) %s  %s\n' "$w" "$b"; continue; }
