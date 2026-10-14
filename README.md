@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 구분 | 위치 | 하는 일 |
 |---|---|---|
 | 규칙 | `~/.claude/CLAUDE.md` "작업 격리" 절 | Claude가 언제 워크트리를 쓰고 어떻게 끝내는지 |
-| 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / train / verify / list / gc / overlap / claim / unclaim / claims |
+| 도구 | `~/.claude/bin/wt` (PATH의 `wt`) | start / finish / train / verify / list / gc / overlap / claim / unclaim / claims / queue |
 | 훅 | `~/.claude/hooks/wt-main-guard` | 메인 폴더의 추적 파일 Edit/Write 차단 |
 | 훅 | `~/.claude/hooks/wt-remove-guard` | 다른 살아 있는 세션의 워크트리 삭제·잠금 해제 차단 |
 | 훅 | `~/.claude/hooks/wt-session-status` | 세션 시작 때 반영된 워크트리 자동 정리 + 남은 워크트리 알림 |
@@ -47,8 +47,8 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 명령 | 어디서 | 동작 |
 |---|---|---|
 | `wt start <슬러그> [--base <브랜치>]` | 저장소 안 어디서나 | `origin/<base>` fetch → `wt/<슬러그>` 브랜치로 워크트리 생성 → `.worktreeinclude` 복사 → `.claude/wt-setup.sh` 실행 → 소유 표식 기록 → 다른 레인과 겹치는 파일 출력 → 마지막 줄에 경로 출력 |
-| `wt finish [--title "..."]` | 워크트리 안 | 5절 순서로 머지·정리 |
-| `wt train [--title "..."] <레인>...` | 저장소 안 어디서나 | 끝난 레인 여럿을 검증 한 번으로 한꺼번에 머지(5-1절). 레인은 슬러그·브랜치·워크트리 경로 |
+| `wt finish [--title "..."] [--priority critical\|release\|normal] [--wait <초>]` | 워크트리 안 | 5절 순서로 머지·정리. `--priority`는 머지 대기열 등급(기본 normal), `--wait`은 차례를 기다릴 최대 시간(기본 3600초, 넘으면 종료 코드 3) |
+| `wt train [--title "..."] [--priority …] [--wait <초>] <레인>...` | 저장소 안 어디서나 | 끝난 레인 여럿을 검증 한 번으로 한꺼번에 머지(5-1절). 레인은 슬러그·브랜치·워크트리 경로 |
 | `wt verify` | 워크트리 안 | `.claude/wt-verify.sh` 실행. 통과하면 그 코드의 트리 해시를 기록하고, rebase 뒤에도 트리가 같으면 finish가 검증을 건너뛴다. 미커밋 변경이 있으면 거절 |
 | `wt list [--conflicts]` | 저장소 안 어디서나 | 워크트리·브랜치 상태(레인마다 **자기 기준** 대비 앞선 커밋 수, `[기준 v2]`, `[<기준>에 반영됨]`, `[기준 브랜치]`, 미커밋 변경, 소유자). `--conflicts`는 레인별 예상 충돌 |
 | `wt gc [--apply]` | 저장소 안 어디서나 | 자기 기준에 이미 반영된 워크트리·브랜치 정리. 기준 브랜치는 지우지 않는다(12절). 기본은 목록만 |
@@ -57,18 +57,22 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | `wt claim <이름> [--wait <초>] [--stale <초>] [--pid <pid>] [--note <글>]` | 저장소 안 어디서나 | 기계 간 선점(6-1절). 종료 코드 0 + sha, 3 + 선점자 줄, 1 실패 |
 | `wt unclaim <이름> <sha>` | 저장소 안 어디서나 | 선점이 아직 그 sha일 때만 지운다(이미 없으면 0, 다른 sha면 1) |
 | `wt claims` | 저장소 안 어디서나 | origin의 선점 목록(이름·선점자·나이) |
+| `wt queue [--base <브랜치>]` | 저장소 안 어디서나 | 머지 대기열 목록(6-2절): 순번·등급·host·kind·레인·나이·`[차례]`·번호표 ref·메모 |
+| `wt queue enter <merge\|train\|release> [--priority …] [--wait <초>] [--pid <pid>] [--note <글>] [--base <브랜치>] [--lane <이름>]` | 저장소 안 어디서나 | 번호표를 받아 차례를 기다린다. 종료 코드 0 + 번호표 ref(차례를 쥔 채 끝남), 3 시간 초과(번호표는 지움), 1 실패 |
+| `wt queue leave <번호표 ref>` | 저장소 안 어디서나 | 번호표를 지우고, 차례를 쥐고 있었으면 놓는다(이미 없으면 0) |
 
 ## 5. `wt finish` 순서
 
 1. 미커밋 변경·진행 중 rebase가 있으면 중단. 다른 살아 있는 세션 소유면 중단(`wt claim --force` 또는 `WT_FORCE_FINISH=1` 필요).
 2. 충돌 예고를 한 줄로 요약한다(다른 레인과 충돌 예상, 기준과 충돌 예상, 자동 병합 가능 겹침 개수. 자세히는 `wt overlap`).
-3. 머지 잠금 `<git-common-dir>/wt-merge.lock`에 flock을 건다(finish·train 공용, `python3` 사용). 동시에 끝나는 레인은 차례로 머지된다. 쥔 쪽이 살아 있는 동안은 기다리고(1분마다 안내), 쥔 쪽이 어떻게 끝나든(강제 종료 포함) OS가 잠금을 풀어 멈춘 잠금이 남지 않는다. 검증·준비 스크립트와 git·gh에는 잠금 fd를 넘기지 않는다(물려받은 데몬이 잠금을 붙들지 않게).
+3. GitHub 원격 + `gh`가 아니면 머지 잠금 `<git-common-dir>/wt-merge.lock`에 flock을 건다(finish·train 공용, `python3` 사용). GitHub면 잠금 대신 7번의 머지 대기열이 이 기계 안팎의 순서를 정하고, rebase·검증은 줄 밖에서 동시에 미리 한다. 동시에 끝나는 레인은 차례로 머지된다. 쥔 쪽이 살아 있는 동안은 기다리고(1분마다 안내), 쥔 쪽이 어떻게 끝나든(강제 종료 포함) OS가 잠금을 풀어 멈춘 잠금이 남지 않는다. 검증·준비 스크립트와 git·gh에는 잠금 fd를 넘기지 않는다(물려받은 데몬이 잠금을 붙들지 않게).
 4. `origin/<base>`를 fetch하고(base = 그 레인의 기준), 새 커밋이 없으면 정리만 한다.
 5. `origin/<base>` 위로 rebase. 충돌이면 중단 → 그 워크트리에서 풀고 `git rebase --continue` → 검증 → finish 재실행.
    - 기준이 이미 들어 있으면 rebase하지 않는다. 레인 안에 합치기 커밋이 있으면(여러 레인을 합친 통합 레인) rebase 대신 기준을 merge로 받는다. rebase는 합치기를 한 줄로 다시 쌓아 이미 푼 충돌을 또 내기 때문이다. squash 머지라 결과는 같다. merge 충돌이면 풀고 `git commit` → 검증 → finish 재실행.
 6. `.claude/wt-verify.sh`가 있으면 실행. 실패하면 머지하지 않는다. rebase 뒤 트리가 `wt verify`(또는 앞선 finish)가 통과시킨 트리와 같으면 건너뛴다(`WT_FORCE_VERIFY=1`이면 늘 실행).
-7. GitHub 원격 + `gh`가 있으면: **머지 직전 재확인**(아래) → push(`--force-with-lease`) → PR 생성(없을 때) → **squash 머지**(`--match-head-commit <검증한 커밋>`) → 상태가 `MERGED`인지 확인 → 선점 해제 → 원격 브랜치 삭제.
-   - 머지 직전 재확인: 머지 잠금(3번)은 한 기계 안에서만 줄을 세운다. 다른 기계가 같은 원격에 그사이 머지하면 GitHub는 같은 줄 충돌만 막으므로 검증하지 않은 조합이 들어갈 수 있다. 그래서 검증을 마친 뒤 origin에 머지 선점 `merge-<base>`를 잡고(6-1절, 다른 곳이 쥐고 있으면 최대 20분 기다림) `origin/<base>`를 다시 받는다. 레인이 이미 그것을 포함하면 머지한다. 움직였으면 선점을 내려놓고 다시 rebase(충돌이면 5번처럼 멈춤) → 트리가 검증 기록과 다르면 다시 검증 → 처음부터. 5번 넘게 움직이면 "계속 움직여 머지하지 못했습니다"로 멈춘다(워크트리는 남는다). 선점은 검증 중에는 쥐지 않고 push·PR·머지 동안만 쥔다. 어떻게 끝나든(실패·Ctrl-C) 쥔 선점을 푼다.
+7. GitHub 원격 + `gh`가 있으면: **머지 번호표**(6-2절, kind `merge`, `--priority`) → 차례 기다림(1분마다 `머지 순번 k/n · 앞: <host> <레인 또는 kind>(m분째)`) → **차례를 받은 뒤 재확인**(아래) → push(`--force-with-lease`) → PR 생성(없을 때) → **squash 머지**(`--match-head-commit <검증한 커밋>`) → 상태가 `MERGED`인지 확인 → 번호표 지움 → 원격 브랜치 삭제.
+   - 차례를 받은 뒤 재확인: GitHub는 같은 줄 충돌만 막으므로 기다리는 사이 앞 작업이 머지한 기준 위에 검증하지 않은 조합이 들어갈 수 있다. 그래서 차례를 받으면 `origin/<base>`를 다시 받는다. 레인이 이미 그것을 포함하면 머지한다. 움직였으면 **차례를 쥔 채** 다시 rebase(충돌이면 5번 문장으로 멈추고 번호표를 놓음) → 트리가 검증 기록과 다르면 다시 검증 → 다시 확인. 대기열 밖에서 계속 push하는 곳이 있어 5번 넘게 움직이면 "계속 움직여 머지하지 못했습니다"로 멈춘다(워크트리는 남는다). push 직전에 차례를 아직 쥐고 있는지(낡은 것으로 넘겨받히지 않았는지) 본다.
+   - 차례가 `--wait`(기본 3600초) 안에 오지 않으면 종료 코드 3으로 끝난다(워크트리는 남는다). 어떻게 끝나든(실패·Ctrl-C·시간 초과) 번호표를 지운다.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.
 8. 하네스가 건 `claude agent …` 잠금만 풀고 워크트리·로컬 브랜치 삭제.
 9. 메인 폴더가 그 기준 브랜치에 있으면 `origin/<base>`로 fast-forward.
@@ -78,10 +82,10 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 병렬 레인이 함께 끝나면 `wt finish`는 레인마다 rebase → 전체 검증 → 머지를 잠금 안에서 차례로 돈다. 앞 레인이 기준을 바꾸니 검증 기록도 매번 빗나가 전체 검증이 레인 수만큼 돈다. `wt train`은 이것을 한 번으로 줄인다.
 
 1. 레인을 모두 확인한다. 하나라도 안 되면 아무것도 하지 않는다: 워크트리 있음, 미커밋 변경·진행 중 rebase 없음, 다른 세션 소유·다른 세션 에이전트 잠금·`git worktree lock`(하네스 외 사유) 아님, 기준 브랜치(기본 브랜치·다른 레인의 기준·`wt.protect`·원격이 앞선 브랜치) 아님, **모두 같은 기준**. 레인은 슬러그·브랜치·워크트리 경로(실행한 폴더 기준 상대 경로 가능)로 준다.
-2. 잠금을 한 번 잡고 `origin/<base>`에 임시 통합 워크트리(`<저장소>.wt/.train-<pid>`, detached)를 만든다.
+2. (GitHub가 아니면 잠금을 한 번 잡고) `origin/<base>`에 임시 통합 워크트리(`<저장소>.wt/.train-<pid>`, detached)를 만든다.
 3. 준 순서대로 레인마다 그 순간의 커밋을 `git merge --squash` → 커밋 하나(메시지는 finish의 squash 메시지와 같다). 이름이 아니라 커밋으로 쌓으므로 같은 이름의 태그와 섞이지 않는다. 충돌 나는 레인은 빼고 계속한다. 이미 기준에 들어 있는 레인은 정리만 한다.
 4. 쌓은 결과에 `.worktreeinclude`·`.claude/wt-setup.sh`를 적용하고(의존성을 바꾼 레인도 그 의존성으로 검증되게) `.claude/wt-verify.sh`를 **한 번** 실행한다. 실패하면 아무것도 머지하지 않고 레인을 그대로 둔다 → 레인마다 `wt finish`로 각자 검증·머지.
-5. GitHub 원격 + `gh`면 finish와 같이 머지 선점 `merge-<base>`를 잡고 `origin/<base>`를 다시 받는다. 검증하는 사이 움직였으면 아무것도 push하지 않고 멈춘다(종료 코드 1, 레인은 그대로 — `wt train`을 다시 실행하면 새 기준에 다시 쌓아 검증한다). 그대로면 통합 결과를 `wt/train-…` 브랜치로 push → PR → **rebase 머지**(`--match-head-commit`, 레인마다 커밋 하나가 그대로 남는다) → `MERGED` 확인 → 원격 브랜치 삭제. 머지가 막히면(rebase 머지 꺼짐·보호 규칙·필수 체크) PR을 닫고 브랜치를 지운 뒤 멈춘다 — 레인은 그대로이니 레인마다 `wt finish`. 원격이 없거나 GitHub가 아니면 기준 브랜치로 push·fast-forward.
+5. GitHub 원격 + `gh`면 묶음 하나가 머지 번호표 하나(kind `train`, 메모에 레인 이름)로 finish와 같이 차례를 기다리고, 차례를 받으면 `origin/<base>`를 다시 받는다. 검증하는 사이 움직였으면 아무것도 push하지 않고 멈춘다(종료 코드 1, 번호표는 지움, 레인은 그대로 — `wt train`을 다시 실행하면 새 기준에 다시 쌓아 검증한다). 그대로면 통합 결과를 `wt/train-…` 브랜치로 push → PR → **rebase 머지**(`--match-head-commit`, 레인마다 커밋 하나가 그대로 남는다) → `MERGED` 확인 → 원격 브랜치 삭제. 머지가 막히면(rebase 머지 꺼짐·보호 규칙·필수 체크) PR을 닫고 브랜치를 지운 뒤 멈춘다 — 레인은 그대로이니 레인마다 `wt finish`. 원격이 없거나 GitHub가 아니면 기준 브랜치로 push·fast-forward.
 6. 통합 워크트리와, 머지된 레인·이미 들어 있던 레인의 워크트리·브랜치를 지우고 메인 폴더를 fast-forward. 원격에도 있던 레인 브랜치는 내용이 기준에 다 들어 있을 때만 지운다. **쌓은 뒤 레인에 새 커밋이나 미커밋 변경이 생겼으면 그 레인은 지우지 않는다**(쌓은 부분은 들어갔고, 남은 변경은 그 워크트리에서 `wt finish`).
 7. 종료 코드: 0 = 모두 머지·정리, 3 = 충돌로 뺐거나 쌓은 뒤 바뀌어 남긴 레인이 있음(목록 출력), 1 = 실패(아무것도 머지 안 함, 또는 머지 단계 오류 안내).
 
@@ -108,7 +112,6 @@ squash 커밋 메시지: 커밋이 1개면 그 메시지 그대로, 여러 개�
 - `--wait <초>`: 그 시간까지 몇 초 간격으로 다시 시도하고, 끝내 못 잡으면 3.
 - 낡은 선점은 경고 한 줄(`경고: 낡은 선점을 넘겨받습니다(<이름>): …`) 뒤 그 sha에 lease를 건 삭제로 치우고 잡는다: 커밋 시각이 `--stale <초>`(기본 10800 = 3시간)보다 오래됐거나, 같은 호스트에서 그 pid가 끝났을 때. 다른 호스트의 pid는 살았는지 알 수 없으므로 시간으로만 판정한다.
 - 해제: `wt unclaim <이름> <sha>` — 원격이 아직 그 sha일 때만 lease를 건 삭제. 넘겨받힌 뒤 늦게 푸는 쪽이 남의 선점을 지우지 않는다.
-- finish·train은 머지 직전에 `merge-<base>`를 스스로 잡는다(5절 7번). 머지 구간은 짧으므로 다른 호스트에서 강제 종료로 남은 머지 선점은 15분 뒤 넘겨받는다.
 
 저장소의 공개 스크립트처럼 기계마다 같은 일을 하면 안 되는 작업은 선점으로 감싼다. 예: 같은 버전을 두 기계가 동시에 공개하지 않게
 
@@ -119,7 +122,42 @@ trap 'wt unclaim "release-v$version" "$claim"' EXIT
 # … 빌드·태그·공개 …
 ```
 
-`--pid $$`로 스크립트 자신의 pid를 남기면, 스크립트가 강제 종료된 뒤 같은 기계에서 다시 실행할 때 바로 넘겨받는다. 기본 브랜치에 직접 push하는 스크립트는 `merge-<기본 브랜치>`도 함께 잡으면 finish·train과 줄을 선다.
+`--pid $$`로 스크립트 자신의 pid를 남기면, 스크립트가 강제 종료된 뒤 같은 기계에서 다시 실행할 때 바로 넘겨받는다. 기본 브랜치에 직접 push하는 스크립트는 선점 대신(또는 함께) 머지 대기열(6-2절)에 줄을 서야 finish·train과 순서가 맞는다.
+
+## 6-2. 머지 대기열 — `wt queue`
+
+같은 원격에 여러 기계·세션이 머지·공개할 때 순서를 origin에서 정한다. finish·train(GitHub 원격 + `gh`)은 스스로 줄을 서고, 기본 브랜치에 직접 push하는 공개 스크립트 같은 외부 작업은 `wt queue enter`로 줄을 선다. GitHub가 아니거나 origin이 없으면 대기열 없이 이 기계의 flock만 쓴다.
+
+- **번호표** = origin의 `refs/wt-queue/<기준>/<번호>`(기준의 `/`는 `_`). 번호는 `<UTC 밀리초 13자리>-<host>-<pid>`라 이름이 겹치지 않고 문자열 순서가 받은 순서다. 부모 없는 빈 커밋을 빈 lease로 만든다. 제목 한 줄 `wt-queue host=… pid=… at=… kind=merge|train|release priority=critical|release|normal lane=… note=…`.
+- **순서** = 차례를 쥔 번호표가 맨 앞, 나머지는 등급(`critical` → `release` → `normal`) 다음 번호(먼저 받은 순).
+- **차례 쥐기·맨 앞 보호**: 맨 앞이 된 번호표는 `refs/wt-queue/<기준>/_head`(제목 `wt-queue-head ticket=<번호>`)를 빈 lease로 만들어 차례를 쥔다. 서버가 원자적으로 판정하므로 둘이 동시에 맨 앞이라 판단해도 하나만 쥔다. 쥔 뒤에는 등급이 더 높은 번호표가 와도 그 일이 끝날 때까지 기다린다(끼어들기는 기다리는 줄 안에서만).
+- **살아 있음**: 기다리는 동안과 finish·train이 차례를 쥔 동안 1분마다 번호표를 새 커밋 시각으로 다시 올린다. `wt queue enter`는 차례를 받고 끝나면 갱신을 멈춘다(그 뒤는 아래 나이로 판정).
+- **낡은 번호표**: 같은 host에서 그 pid가 끝났으면 바로, 다른 host는 마지막 갱신이 merge·train 30분·release 90분보다 오래됐으면 경고 한 줄(`경고: 낡은 번호표를 지웁니다(<기준>/<번호>): …`) 뒤 그 sha에 lease를 건 삭제. 차례를 쥔 번호표도 같다. `_head`가 가리키는 번호표가 없어지면 `_head`도 지운다(차례가 풀린다).
+- 기다리는 쪽은 1분마다 `▸ 머지 순번 k/n · 앞: <host> <레인 또는 kind>(m분째)`를 낸다.
+- 브랜치가 아니므로 PR·브랜치 목록에 보이지 않는다. `wt queue`로 본다:
+
+```
+머지 대기열 main:
+  1. release  build-host  release  (12분째) [차례]  refs/wt-queue/main/1760…-build-host-4242  v1.2.3 공개
+  2. normal  laptop  merge wt/fix-login (3분째)  refs/wt-queue/main/1760…-laptop-777
+```
+
+### 공개 스크립트 연동
+
+공개 스크립트는 차례를 받은 **뒤에** 기준을 받아 버전을 정하고, 기준 브랜치에 push할 때까지 차례를 쥔다. 그 사이 다른 기계의 finish·train은 줄에서 기다리므로 오래 빌드해도 마지막 push가 밀리지 않는다.
+
+```bash
+ticket=$(wt queue enter release --pid $$ --wait 3600 --note "공개 $(hostname -s)") || {
+  echo "머지 대기열 차례를 받지 못했습니다(종료 코드 $?)" >&2; exit 1; }
+trap 'wt queue leave "$ticket"' EXIT
+git fetch origin main && git checkout --detach origin/main   # 차례를 받은 뒤에 기준을 받는다
+# … 버전 결정 · 빌드 · 태그 …
+git push --atomic origin HEAD:main "refs/tags/v$version"
+wt queue leave "$ticket"; trap - EXIT
+```
+
+- `--pid $$`: 스크립트가 강제 종료되면 같은 기계에서는 바로, 다른 기계에서는 90분 뒤 넘겨받는다. 공개가 90분을 넘길 수 있으면 나눠서 차례를 받는다.
+- 급한 수정은 `wt finish --priority critical`(기다리는 줄에서 맨 앞으로, 차례를 쥔 작업은 끝까지 둔다).
 
 ## 7. 훅 세 개
 
@@ -225,8 +263,9 @@ wt finish --title "..."    # 워크트리 안에서
 | 메인 폴더에서 Edit가 거부됨 | `wt start <슬러그>` 후 워크트리에서 편집 |
 | 재개·압축 뒤 내 워크트리를 이어 씀 | 그 안에서 `wt claim` (주인이 끝난 게 확실할 때만 `--force`) |
 | finish가 "다른 finish·train이 머지 중" | 기다린다. 쥔 쪽이 끝나면(강제 종료 포함) 바로 이어진다 |
-| finish가 "선점 merge-<기준> 을 다른 곳이 쥐고 있어 … 기다립니다" | 다른 기계가 머지 중이다. 기다린다. 오래 멈춰 있으면 `wt claims`로 선점자를 보고, 그 기계에서 끝난 게 확실하면 `wt unclaim merge-<기준> <sha>` |
-| finish가 "계속 움직여 머지하지 못했습니다" | 다른 기계들이 잇달아 머지하는 중이다. 잠시 뒤 `wt finish` 재실행 |
+| finish가 "머지 순번 k/n · 앞: …" | 다른 기계·세션이 머지·공개 중이다. 기다린다. 오래 멈춰 있으면 `wt queue`로 앞 번호표를 보고, 그 작업이 끝난 게 확실하면 `wt queue leave <번호표 ref>`(아니면 낡은 번호표는 30·90분 뒤 저절로 풀린다) |
+| finish가 "계속 움직여 머지하지 못했습니다" | 대기열 밖에서 기준에 잇달아 push하는 곳이 있다(대기열을 쓰지 않는 스크립트 등). 잠시 뒤 `wt finish` 재실행 |
+| finish가 종료 코드 3 "머지 순번을 N분 기다렸지만" | 앞 작업이 오래 걸리는 중이다. `wt queue`로 확인하고 다시 실행(`--wait <초>`로 더 기다릴 수 있다) |
 | 병렬 레인이 여럿 함께 끝남 | 레인마다 finish 대신 `wt train <레인>...`(검증 한 번). 종료 코드 3이면 출력된 남은 레인을 그 워크트리에서 `wt finish` |
 | finish가 rebase 충돌 | 그 워크트리에서 해결 → `git rebase --continue` → `wt verify` → finish 재실행(같은 코드면 검증 생략) |
 | 다른 기준(예: `v2`)에서 작업 | `wt start <슬러그> --base v2`. finish가 v2로 머지한다. 장기 브랜치는 필요하면 `git config wt.protect v2` |
@@ -253,7 +292,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 # 또는 clone한 폴더에서: git pull && bash install.sh
 ```
 
-갱신은 `wt finish`·`wt train`이 돌고 있지 않을 때 한다. 머지 잠금이 폴더(`wt-finish.lock`)에서 flock(`wt-merge.lock`)으로 바뀐 판부터는 갱신 전에 시작된 옛 finish와 새 finish·train이 서로를 기다리지 않는다. `<git-common-dir>/wt-finish.lock` 폴더가 있으면 그 finish가 끝난 뒤 갱신한다. 갱신·설치가 끝나면 같은 제목 절이 이미 있는 `~/.claude/CLAUDE.md`는 바뀌지 않으니, `rules/worktree-isolation.md`의 새 문장을 직접 옮긴다.
+갱신은 `wt finish`·`wt train`이 돌고 있지 않을 때 한다. 머지 순서를 기계 간 머지 선점(`merge-<기준>`)에서 머지 대기열(`refs/wt-queue/`)로 바꾼 판부터는 옛 판과 새 판이 서로 줄을 서지 않으니, 같은 원격을 쓰는 기계를 모두 함께 갱신한다. 머지 잠금이 폴더(`wt-finish.lock`)에서 flock(`wt-merge.lock`)으로 바뀐 판부터는 갱신 전에 시작된 옛 finish와 새 finish·train이 서로를 기다리지 않는다. `<git-common-dir>/wt-finish.lock` 폴더가 있으면 그 finish가 끝난 뒤 갱신한다. 갱신·설치가 끝나면 같은 제목 절이 이미 있는 `~/.claude/CLAUDE.md`는 바뀌지 않으니, `rules/worktree-isolation.md`의 새 문장을 직접 옮긴다.
 
 바뀌는 기존 파일은 `*.bak-<시각>`으로 남긴다. 특정 버전은 `CLAUDE_WT_REF=<태그> bash install.sh`(파이프 설치면 `curl ... | CLAUDE_WT_REF=<태그> bash`).
 
