@@ -45,25 +45,36 @@ echo "설치: ~/.claude/bin/wt, ~/.claude/hooks/wt-{main-guard,remove-guard,sess
 # 훅은 /usr/bin/python3를 직접 부른다.
 [ -x /usr/bin/python3 ] || echo "경고: /usr/bin/python3가 없습니다. ~/.claude/hooks/wt-* 안의 /usr/bin/python3를 $(command -v python3) 로 바꾸세요" >&2
 
-# 2) settings.json 훅 등록(기존 설정 유지, 중복 등록 안 함)
-[ -f "$CLAUDE_DIR/settings.json" ] && cp "$CLAUDE_DIR/settings.json" "$CLAUDE_DIR/settings.json.bak-$ts"
-python3 - "$CLAUDE_DIR/settings.json" <<'PY_EOF'
-import json, os, sys
-p = sys.argv[1]
+# 2) settings.json 훅 등록(기존 설정 유지, 중복 등록 안 함). 이미 다 있으면 파일을 건드리지 않고(갱신 설치),
+# 바꿀 때는 .bak-<시각>을 남긴 뒤 새 파일로 바꿔 끼운다(실행 중인 Claude Code가 반쯤 쓴 파일을 읽지 않게).
+python3 - "$CLAUDE_DIR/settings.json" "$ts" <<'PY_EOF'
+import json, os, shutil, sys
+p, ts = sys.argv[1], sys.argv[2]
 d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
 hooks = d.setdefault("hooks", {})
+changed = False
 def add(event, matcher, name):
+    global changed
     cmd = '"$HOME/.claude/hooks/%s"' % name
     arr = hooks.setdefault(event, [])
     for m in arr:
         if m.get("matcher") == matcher and any(h.get("command") == cmd for h in m.get("hooks", [])):
             return
     arr.append({"matcher": matcher, "hooks": [{"type": "command", "command": cmd, "timeout": 5}]})
+    changed = True
 for m in ("startup", "resume", "clear", "compact"):
     add("SessionStart", m, "wt-session-status")
 add("PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", "wt-main-guard")
 add("PreToolUse", "Bash", "wt-remove-guard")
-json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+if not changed:
+    print("settings.json: 훅이 이미 등록돼 있어 그대로 둠")
+    sys.exit(0)
+if os.path.exists(p):
+    shutil.copy2(p, "%s.bak-%s" % (p, ts))
+tmp = "%s.new.%d" % (p, os.getpid())
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+os.replace(tmp, p)
 print("settings.json 훅 등록:", p)
 PY_EOF
 

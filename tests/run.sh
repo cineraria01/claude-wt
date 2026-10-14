@@ -250,6 +250,54 @@ git -C "$R" worktree add -q --detach "$R.wt/.train-$DEAD" origin/main
 check "끝난 pid의 .train- 워크트리 정리" has "$("$WT" gc --apply 2>&1)" "정리 대상(끝난 train의 통합 워크트리) $R.wt/.train-$DEAD"
 check "실제로 지워짐" [ ! -e "$R.wt/.train-$DEAD" ]
 
+echo "⑫-0 기계 간 선점: wt claim / unclaim / claims"
+cd "$R"
+claim_at() { # 이름 host pid 커밋시각 — 다른 기계·오래된 선점을 직접 만들어 origin에 둔다
+  local s; s=$(GIT_COMMITTER_DATE="$4" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt claim $1" -m "host=$2 pid=$3 at=old note=") \
+    && git push -q origin "$s:refs/wt-claims/$1"
+}
+rsha() { git ls-remote origin "refs/wt-claims/$1" | cut -f1; }
+rc=0; S1=$("$WT" claim rel-1 --pid $$ --note "첫 공개" 2>/dev/null) || rc=$?
+check "첫 선점 0 + sha" bash -c "[ $rc = 0 ] && [[ '$S1' =~ ^[0-9a-f]{40}$ ]]"
+check "origin에 refs/wt-claims/rel-1" [ "$(rsha rel-1)" = "$S1" ]
+rc=0; out=$("$WT" claim rel-1 2>/dev/null) || rc=$?
+check "두 번째 선점 3" [ "$rc" = 3 ]
+check "선점자 한 줄(sha·host·pid·note)" has "$out" "sha=$S1 host=$(hostname -s) pid=$$ at="
+check "  └ note" has "$out" "note=첫 공개"
+check "엉뚱한 sha로 unclaim하면 1" bash -c "! '$WT' unclaim rel-1 0000000000000000000000000000000000000000 2>/dev/null"
+check "  └ 선점은 남음" [ "$(rsha rel-1)" = "$S1" ]
+out=$("$WT" claims 2>&1)
+check "claims 목록에 이름·선점자" has "$out" "rel-1  host=$(hostname -s) pid=$$"
+check "  └ 나이" has "$out" "(0분 전)"
+check "맞는 sha로 unclaim하면 지움" bash -c "'$WT' unclaim rel-1 '$S1' && [ -z \"\$(git ls-remote origin refs/wt-claims/rel-1)\" ]"
+check "이미 없으면 unclaim 0" "$WT" unclaim rel-1 "$S1"
+check "빈 목록" has "$("$WT" claims 2>&1)" "선점 없음"
+"$WT" claim rel-2 >/dev/null 2>&1
+s=$(date +%s); rc=0; out=$("$WT" claim rel-2 --wait 2 2>&1) || rc=$?
+check "--wait 시간 초과면 3" [ "$rc" = 3 ]
+check "  └ 기다린 시간 2초 이상" [ $(($(date +%s) - s)) -ge 2 ]
+check "  └ 대기 안내" has "$out" "최대 2초 기다립니다"
+R2=$(rsha rel-2); (sleep 1; "$WT" unclaim rel-2 "$R2") & UP=$!
+rc=0; "$WT" claim rel-2 --wait 15 >/dev/null 2>&1 || rc=$?; wait "$UP"
+check "--wait 중에 풀리면 잡음" bash -c "[ $rc = 0 ] && [ '$(rsha rel-2)' != '$R2' ]"
+claim_at old elsewhere 1 "2020-01-01T00:00:00Z"
+rc=0; out=$("$WT" claim old 2>&1) || rc=$?
+check "오래된 선점(--stale 초과)은 넘겨받음" [ "$rc" = 0 ]
+check "  └ 경고" has "$out" "경고: 낡은 선점을 넘겨받습니다(old)"
+claim_at young elsewhere 1 "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+rc=0; "$WT" claim young --stale 3600 >/dev/null 2>&1 || rc=$?
+check "다른 host의 pid는 끝났는지 몰라 넘겨받지 않음(3)" [ "$rc" = 3 ]
+"$WT" claim dead --pid "$DEAD" >/dev/null 2>&1
+rc=0; out=$("$WT" claim dead 2>&1) || rc=$?
+check "같은 host의 끝난 pid 선점은 넘겨받음" [ "$rc" = 0 ]
+check "  └ 경고" has "$out" "낡은 선점을 넘겨받습니다(dead)"
+check "잘못된 이름 거절" bash -c "! '$WT' claim 'a/b' 2>/dev/null"
+git init -q "$T/noorigin"; (cd "$T/noorigin" && git commit -q --allow-empty -m x)
+rc=0; out=$(cd "$T/noorigin" && "$WT" claim x 2>&1) || rc=$?
+check "origin 없으면 claim 1 + 안내" bash -c "[ $rc = 1 ] && printf '%s' '$out' | grep -F 'origin 원격이 없어' >/dev/null"
+check "인자 없는 wt claim은 워크트리 맡기 그대로" has "$(cd "$U1" && "$WT" claim 2>&1)" "이 세션이 $U1 를 맡습니다"
+for n in rel-2 old young dead; do git push -q origin ":refs/wt-claims/$n" 2>/dev/null || true; done
+
 echo "⑫ wt train: GitHub 경로(gh 흉내, 원격 주소에 github.com)"
 G="$T/github.com/gh.git"; GS="$T/ghstate"; mkdir -p "$T/github.com" "$GS"
 git clone -q --bare "$T/origin.git" "$G"
@@ -261,9 +309,16 @@ case "$1 $2" in
   "pr create") shift 2; while [ $# -gt 0 ]; do case $1 in --base) b=$2; shift 2 ;; --head) h=$2; shift 2 ;; *) shift ;; esac; done
                echo "$b $h" >"$GH_STATE/pr"; rm -f "$GH_STATE/merged"; echo "https://github.com/o/r/pull/7" ;;
   "pr list") [ -f "$GH_STATE/pr" ] && [ ! -f "$GH_STATE/merged" ] && echo 7 || true ;;
-  "pr merge") [ "$4" = --rebase ] || exit 1; [ -z "${GH_FAIL_MERGE-}" ] || exit 1
+  "pr merge") [ -z "${GH_FAIL_MERGE-}" ] || exit 1
+              shift 3; m="" want="" subj=squash; while [ $# -gt 0 ]; do case $1 in --rebase|--squash) m=$1; shift ;; --match-head-commit) want=$2; shift 2 ;; --subject) subj=$2; shift 2 ;; *) shift ;; esac; done
               read -r b h <"$GH_STATE/pr"; c=$(mktemp -d); git clone -q "$GH_ORIGIN" "$c"
-              (cd "$c" && git checkout -q "$h" && git rebase -q "origin/$b" && git push -q origin "HEAD:$b"); rm -rf "$c"; touch "$GH_STATE/merged" ;;
+              # GitHub처럼: 헤드가 --match-head-commit과 다르면 거절. 기준이 움직였어도 같은 줄 충돌만 없으면 머지한다.
+              [ -z "$want" ] || [ "$(git -C "$c" rev-parse "origin/$h")" = "$want" ] || { rm -rf "$c"; exit 1; }
+              case $m in
+                --rebase) (cd "$c" && git checkout -q "$h" && git rebase -q "origin/$b" && git push -q origin "HEAD:$b") ;;
+                --squash) (cd "$c" && git checkout -q "$b" && git merge -q --squash "origin/$h" && git commit -qm "$subj" && git push -q origin "HEAD:$b") ;;
+                *) exit 1 ;;
+              esac; rm -rf "$c"; touch "$GH_STATE/merged" ;;
   "pr close") read -r b h <"$GH_STATE/pr"; git --git-dir="$GH_ORIGIN" branch -D "$h" >/dev/null ;;
   "pr view") echo MERGED ;;
 esac
@@ -288,6 +343,51 @@ check "rebase 머지로 레인별 커밋 2개" [ "$(git -C "$GR" rev-list --coun
 check "PR 제목은 --title" has "$(cat "$GS/calls")" "--title 묶음"
 check "원격 레인 브랜치·train 브랜치 정리" bash -c "[ -z \"\$(git --git-dir='$G' for-each-ref --format='%(refname)' refs/heads/wt/)\" ]"
 check "메인 폴더 fast-forward" [ -f "$GR/g2.txt" ]
+check "train 머지에 --match-head-commit" has "$(cat "$GS/calls")" "--rebase --match-head-commit"
+check "train 머지 선점을 풀고 끝남" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-claims/*')\" ]"
+
+echo "⑫-1 머지 직전 재확인: 검증 중에 다른 기계가 main에 머지하면 다시 올려 검증"
+# 검증 첫 실행 때 다른 기계 흉내로 origin main에 커밋을 하나 넣는다.
+ELSE="rm -rf '$T/gh-else' && git clone -q '$G' '$T/gh-else' && (cd '$T/gh-else' && echo \$RANDOM >else-\$RANDOM.txt && git add -A && git commit -qm else && git push -q origin main)"
+F1=$(gstart f1); echo f1 >"$F1/f1.txt"; commit "$F1" "f1 추가"
+runs=$(verify_runs); rm -f "$T/moved"; : >"$GS/calls"
+rc=0; out=$(cd "$F1" && PATH="$T/bin:$PATH" VERIFY_HOOK="[ -f '$T/moved' ] || { touch '$T/moved'; $ELSE; }" "$WT" finish 2>&1) || rc=$?
+git -C "$GR" fetch -q origin
+check "finish 성공" [ "$rc" = 0 ]
+check "검증 2회(움직인 뒤 다시)" [ "$(verify_runs)" = $((runs + 2)) ]
+check "다시 올림 안내" has "$out" "검증하는 사이 origin/main이 움직였습니다"
+check "두 커밋 모두 origin main에" bash -c "git -C '$GR' cat-file -e origin/main:f1.txt && git -C '$GR' log --format=%s origin/main | grep -x else >/dev/null"
+check "squash 머지에 --match-head-commit" has "$(cat "$GS/calls")" "--squash --match-head-commit"
+check "머지 선점을 풀고 끝남" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-claims/*')\" ]"
+F2=$(gstart f2); echo f2 >"$F2/f2.txt"; commit "$F2" "f2 추가"
+rc=0; out=$(cd "$F2" && PATH="$T/bin:$PATH" VERIFY_HOOK="$ELSE" "$WT" finish 2>&1) || rc=$?
+check "검증마다 움직이면 5번 뒤 멈춤" bash -c "[ $rc = 1 ] && printf '%s' \"\$1\" | grep -F 'main가 계속 움직여 머지하지 못했습니다' >/dev/null" _ "$out"
+check "  └ 선점 남기지 않음" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-claims/*')\" ]"
+check "  └ 워크트리 남음" [ -d "$F2" ]
+git -C "$GR" fetch -q origin
+check "  └ f2는 main에 없음" bash -c "! git -C '$GR' cat-file -e origin/main:f2.txt 2>/dev/null"
+(cd "$GR" && "$WT" claim merge-main --pid $$ >/dev/null 2>&1)
+(cd "$F2" && PATH="$T/bin:$PATH" exec "$WT" finish >"$T/wait.out" 2>&1) & WP=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do grep -F '기다립니다' "$T/wait.out" >/dev/null 2>&1 && break; sleep 1; done
+# Ctrl-C처럼 프로세스 묶음 전체에 보낸다(부모에게만 보내면 bash는 $(…) 자식이 끝날 때까지 트랩을 미룬다).
+kill "$WP"; pkill -P "$WP" 2>/dev/null || true; wait "$WP" 2>/dev/null || true
+check "다른 곳이 머지 선점을 쥐고 있으면 기다림" has "$(cat "$T/wait.out")" "선점 merge-main 을 다른 곳이 쥐고 있어 최대 1200초 기다립니다"
+check "  └ 남의 선점은 건드리지 않음" [ -n "$(git ls-remote "$G" refs/wt-claims/merge-main)" ]
+git push -q "$G" ":refs/wt-claims/merge-main"
+rc=0; (cd "$F2" && PATH="$T/bin:$PATH" "$WT" finish >/dev/null 2>&1) || rc=$?
+git -C "$GR" fetch -q origin
+check "선점이 풀린 뒤 finish 성공" bash -c "[ $rc = 0 ] && git -C '$GR' cat-file -e origin/main:f2.txt"
+
+echo "⑫-2 train도 검증 중에 main이 움직이면 머지하지 않고 멈춤"
+H1=$(gstart h1); echo h1 >"$H1/h1.txt"; commit "$H1" "h1 추가"
+git -C "$GR" fetch -q origin; BEFORE=$(git -C "$GR" rev-parse origin/main)
+rc=0; out=$(cd "$GR" && PATH="$T/bin:$PATH" VERIFY_HOOK="$ELSE" "$WT" train h1 2>&1) || rc=$?
+git -C "$GR" fetch -q origin
+check "train 실패" [ "$rc" = 1 ]
+check "  └ 안내" has "$out" "검증하는 사이 origin/main이 움직여 머지하지 않았습니다"
+check "  └ h1은 main에 없음" bash -c "! git -C '$GR' cat-file -e origin/main:h1.txt 2>/dev/null"
+check "  └ 레인 남음" [ -d "$H1" ]
+check "  └ 선점·train 브랜치 남기지 않음" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-claims/*' 'refs/heads/wt/train-*')\" ]"
 
 echo "⑦ gc의 24시간 판정은 status가 건드리는 파일을 사용 흔적으로 안 본다"
 OLD=$(start gc-old); FRESH=$(start gc-fresh)

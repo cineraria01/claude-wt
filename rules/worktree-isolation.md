@@ -19,7 +19,7 @@
 - 워크트리는 파일만 나눈다. 포트, 실행 중인 앱, DB, 키체인은 공유하니 앱 실행·실기 확인은 한 번에 하나만. 배포·릴리스는 머지된 메인 폴더에서 한다.
 
 **끝낼 때**
-- 커밋 → 저장소 검증 → 워크트리 안에서 `wt finish [--title "..."]` → `ExitWorktree(action="keep")`. finish가 rebase → `.claude/wt-verify.sh`(있으면) → push → PR → **squash 머지** → 브랜치·워크트리 삭제 → 메인 폴더 fast-forward까지 한다(원격이 없거나 GitHub가 아니면 로컬 squash). 동시에 끝나면 잠금으로 차례로 머지한다.
+- 커밋 → 저장소 검증 → 워크트리 안에서 `wt finish [--title "..."]` → `ExitWorktree(action="keep")`. finish가 rebase → `.claude/wt-verify.sh`(있으면) → push → PR → **squash 머지** → 브랜치·워크트리 삭제 → 메인 폴더 fast-forward까지 한다(원격이 없거나 GitHub가 아니면 로컬 squash). 동시에 끝나면 잠금으로 차례로 머지한다. 다른 기계와 겹치면 origin의 머지 선점(`merge-<기준>`)으로 줄을 서고, 검증하는 사이 기준이 움직였으면 다시 rebase·검증한 뒤 머지한다.
 - `wt-verify.sh`가 없는 저장소에서 main이 그사이 움직였으면 rebase 뒤 검증을 직접 다시 돌리고 finish한다.
 - finish가 rebase 충돌·검증 실패로 멈추면 그 워크트리에서 고쳐 다시 실행한다. 강제 해결·검증 생략은 하지 않는다. 충돌을 풀었으면 `wt verify` 후 `wt finish`(코드가 같으면 finish가 같은 검증을 건너뛴다). 머지 차단(보호 규칙·체크)은 사용자에게 보고한다.
 - finish 뒤 원격 브랜치를 손으로 다시 지우지 않는다(이미 지워져 있다).
