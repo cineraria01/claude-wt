@@ -511,10 +511,40 @@ untilf "$T/wait.out" "옛 판 wt의 머지 선점 merge-main"
 check "옛 판 머지 선점(refs/wt-claims/merge-main)이 살아 있으면 기다림" has "$(cat "$T/wait.out")" "옛 판 wt의 머지 선점 merge-main 이 살아 있어 풀릴 때까지 기다립니다"
 sleep 1; git -C "$GR" fetch -q origin
 check "  └ 기다리는 동안 머지하지 않음" bash -c "! git -C '$GR' cat-file -e origin/main:f5.txt 2>/dev/null"
+# 옛 판 finish가 선점을 쥔 채 main에 머지한 장면: 풀린 뒤 기준을 다시 받아 다시 올려 검증해야 한다.
+runs=$(verify_runs); eval "$ELSE"
 (cd "$GR" && "$WT" unclaim merge-main "$(git ls-remote "$G" refs/wt-claims/merge-main | cut -f1)")
 rc=0; wait "$WP" || rc=$?
 git -C "$GR" fetch -q origin
 check "  └ 선점이 풀리면 머지" bash -c "[ $rc = 0 ] && git -C '$GR' cat-file -e origin/main:f5.txt"
+check "  └ 기다리는 사이 main이 움직였으면 다시 올려 검증" bash -c "[ \"\$(wc -l <'$VERIFY_LOG' | tr -d ' ')\" = $((runs + 1)) ] && grep -F '검증하는 사이 origin/main이 움직였습니다' '$T/wait.out' >/dev/null"
+check "  └ 대기열 비움" qgone
+H2=$(gstart h2); echo h2 >"$H2/h2.txt"; commit "$H2" "h2 추가"
+(cd "$GR" && "$WT" claim merge-main --pid $$ >/dev/null 2>&1)
+(cd "$GR" && PATH="$T/bin:$PATH" exec "$WT" train h2 >"$T/train.out" 2>&1) & WP=$!
+untilf "$T/train.out" "옛 판 wt의 머지 선점 merge-main"
+eval "$ELSE"
+(cd "$GR" && "$WT" unclaim merge-main "$(git ls-remote "$G" refs/wt-claims/merge-main | cut -f1)")
+rc=0; wait "$WP" || rc=$?
+git -C "$GR" fetch -q origin
+check "train: 옛 선점을 기다리는 사이 main이 움직이면 머지하지 않고 멈춤" bash -c "[ $rc = 1 ] && grep -F '검증하는 사이 origin/main이 움직여 머지하지 않았습니다' '$T/train.out' >/dev/null && ! git -C '$GR' cat-file -e origin/main:h2.txt 2>/dev/null"
+check "  └ 대기열 비움" qgone
+
+echo "⑫-6 오래 사는 --pid: init·끝난 pid 거절, 갱신 상한, 오래 쥔 차례 표시"
+rc=0; (cd "$GR" && exec "$WT" queue enter release --pid 1 >/dev/null 2>&1) || rc=$?
+check "--pid 1 거절(2)" bash -c "[ $rc = 2 ] && [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
+rc=0; (cd "$GR" && exec "$WT" queue enter release --pid "$DEAD" >/dev/null 2>&1) || rc=$?
+check "끝난 --pid 거절(2)" [ "$rc" = 2 ]
+QR=$(WT_HOST=hb wq enter release --pid $$ --wait 0 --max-hold 1 2>/dev/null)
+sleep 5; ct0=$(git --git-dir="$G" log -1 --format=%ct "$QR"); sleep 5
+check "--max-hold가 지나면 pid가 살아 있어도 갱신을 멈춤" [ "$(git --git-dir="$G" log -1 --format=%ct "$QR")" = "$ct0" ]
+check "  └ 목록에 [갱신 멈춤]" has "$(wq 2>&1)" "[갱신 멈춤"
+wq leave "$QR"
+O5=$(qat elsewhere 1 merge 0)
+s=$(cd "$GR" && GIT_COMMITTER_DATE="@$(($(date +%s) - 4000)) +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue-head ticket=$O5 at=old")
+git -C "$GR" push -q origin "$s:refs/wt-queue/main/_head"
+check "1시간 넘게 쥔 차례 표시" has "$(wq 2>&1)" "[차례 66분째 쥠 — 오래 쥔 차례]"
+git -C "$GR" push -q origin ":refs/wt-queue/main/_head" ":refs/wt-queue/main/$O5"
 check "  └ 대기열 비움" qgone
 
 echo "⑦ gc의 24시간 판정은 status가 건드리는 파일을 사용 흔적으로 안 본다"

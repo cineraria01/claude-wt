@@ -17,7 +17,7 @@
 #   wt unclaim <이름> <sha>              원격 선점이 아직 그 sha일 때만 지운다(없으면 0, 다른 sha면 1)
 #   wt claims                            origin의 선점 목록(이름·선점자·나이)
 #   wt queue [--base <브랜치>]            머지 대기열(GitHub origin의 refs/wt-queue/<기준>/): 순번·등급·host·kind·나이·차례
-#   wt queue enter <merge|train|release> --pid <pid> [--priority …] [--wait <초>] [--note <글>] [--base <브랜치>] [--lane <이름>]
+#   wt queue enter <merge|train|release> --pid <pid> [--priority …] [--wait <초>] [--max-hold <초>] [--note <글>] [--base <브랜치>] [--lane <이름>]
 #                                        차례가 오면 번호표 ref를 출력하고 0(그 pid가 끝나면 번호표가 지워짐) | 시간 초과 3 | --pid 없음 2 | 실패 1
 #   wt queue leave <번호표 ref>           번호표를 지우고, 차례를 쥐고 있었으면 놓는다
 #
@@ -443,7 +443,7 @@ q_scan() {
   printf '%s' "$rows" | LC_ALL=C sort | cut -f2-
 }
 
-# q_enter <기준> <kind> <priority> <pid> <lane> <note>: 번호표를 만들고 그 pid에 묶인 갱신(q_beat)을 띄운다. WT_Q_REF에 ref.
+# q_enter <기준> <kind> <priority> <pid> <lane> <note> <갱신 상한 초>: 번호표를 만들고 그 pid에 묶인 갱신(q_beat)을 띄운다. WT_Q_REF에 ref.
 q_enter() {
   local qb h id subj sha; qb=$(q_base "$1"); h=$(claim_host); WT_Q_USED=1
   id="$(q_ms)-${h//[^A-Za-z0-9.-]/_}-$4"
@@ -452,16 +452,18 @@ q_enter() {
   git push --quiet --force-with-lease="refs/wt-queue/$qb/$id:" origin "$sha:refs/wt-queue/$qb/$id" >/dev/null 2>&1 || return 1
   WT_Q_REF="refs/wt-queue/$qb/$id"
   # 출력을 /dev/null로: 명령 치환으로 부른 쪽이 남은 sleep 때문에 기다리지 않게. 머지 잠금 fd도 넘기지 않는다.
-  q_beat "$WT_Q_REF" "$sha" "$subj" "$4" >/dev/null 2>&1 9>&- &
+  q_beat "$WT_Q_REF" "$sha" "$subj" "$4" "$7" >/dev/null 2>&1 9>&- &
   WT_Q_HB=$!
 }
-# q_beat <ref> <sha> <제목> <pid>: pid가 살아 있는 동안 번호표를 갱신한다. pid가 끝나면 번호표를 지우고 끝난다.
+# q_beat <ref> <sha> <제목> <pid> <상한 초>: pid가 살아 있는 동안 번호표를 갱신한다. pid가 끝나면 번호표를 지우고 끝난다.
+# 상한(기다림 + 차례를 쥘 최대 시간)이 지나면 갱신을 멈춘다 — 오래 사는 pid를 넘겨도 30분 뒤 낡음으로 풀린다(wt queue에 [갱신 멈춤]).
 # push가 실패하면 origin을 다시 본다: 아직 내 sha(또는 조회 실패)면 다음 주기에 다시, 없어졌거나 다른 sha(남이 낡은 것으로
 # 지움·wt queue leave)면 끝난다 — lease가 어긋나 되살리지 않는다.
 q_beat() {
-  local ref=$1 sha=$2 new cur
+  local ref=$1 sha=$2 new cur end; end=$(($(date +%s) + $5))
   while sleep "${WT_QUEUE_BEAT:-60}"; do
     if ! ps -p "$4" >/dev/null 2>&1; then q_drop "$ref" "" "$sha" || true; exit 0; fi
+    [ "$(date +%s)" -lt "$end" ] || exit 0
     new=$(q_commit "$3") || continue
     if git push --quiet --force-with-lease="$ref:$sha" origin "$new:$ref" >/dev/null 2>&1; then sha=$new; continue; fi
     cur=$(git ls-remote origin "$ref") || continue
@@ -527,7 +529,7 @@ q_leave() {
 }
 # finish·train: 번호표를 받아 차례를 기다린다. 시간 초과는 종료 코드 3(번호표는 on_exit가 지운다).
 queue_turn() { # <기준> <kind> <priority> <lane> <기다릴 초> [<메모>]
-  q_enter "$1" "$2" "$3" $$ "$4" "${6-}" || die "origin에 머지 번호표를 만들지 못했습니다(네트워크·권한). 워크트리는 남겨 둠"
+  q_enter "$1" "$2" "$3" $$ "$4" "${6-}" $(($5 + 10800)) || die "origin에 머지 번호표를 만들지 못했습니다(네트워크·권한). 워크트리는 남겨 둠"
   local rc=0; q_wait "$(q_base "$1")" "${WT_Q_REF##*/}" "$5" || rc=$?
   case $rc in
     0) say "머지 차례를 받았습니다(${WT_Q_REF#refs/wt-queue/})" ;;
@@ -537,11 +539,11 @@ queue_turn() { # <기준> <kind> <priority> <lane> <기다릴 초> [<메모>]
 }
 # 차례를 아직 쥐고 있는지(낡은 것으로 넘겨받히지 않았는지) push 직전에 본다.
 q_holding() {
-  q_old_claim_wait "${WT_Q_REF%/*}"
   [ "$(git ls-remote origin "${WT_Q_REF%/*}/_head" | cut -f1)" = "$WT_Q_HEAD" ]
 }
 # 옛 판 호환, 다음 판에서 제거: 대기열 이전 판의 finish·train은 refs/wt-claims/merge-<기준>을 잡고 머지한다.
 # 그 선점이 살아 있으면(15분 안, 같은 host면 pid도 살아 있음) 풀릴 때까지 최대 20분 기다린다. 못 읽으면 다시 본다.
+# 옛 판이 그사이 머지했을 수 있으니 차례를 받은 직후, 기준을 다시 받는 확인보다 먼저 부른다.
 q_old_claim_wait() { # <refs/wt-queue/<기준>>
   local name="merge-${1##*/}" rc said="" end; end=$(($(date +%s) + 1200))
   while :; do
@@ -558,7 +560,7 @@ cmd_queue() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
   has_origin || die "origin 원격이 없습니다(대기열은 origin의 refs/wt-queue/에 둡니다)"
   local sub=list; case ${1-} in enter|leave|list) sub=$1; shift ;; esac
-  local base="" kind="" prio="" wait=3600 pid="" note="" lane=""
+  local base="" kind="" prio="" wait=3600 pid="" note="" lane="" hold=10800
   if [ $sub = leave ]; then
     [ $# = 1 ] && [[ $1 =~ ^refs/wt-queue/[A-Za-z0-9._-]+/[0-9]+-[A-Za-z0-9._-]+$ ]] || die "사용법: wt queue leave refs/wt-queue/<기준>/<번호>"
     q_drop "$1" || die "번호표 $1 을 지우지 못했습니다(origin 네트워크·권한)"
@@ -566,8 +568,8 @@ cmd_queue() {
   fi
   while [ $# -gt 0 ]; do
     case $1 in
-      --wait|--pid) [[ ${2-} =~ ^[0-9]+$ ]] || die "$1 에는 숫자를 주세요: ${2-}"
-        case $1 in --wait) wait=$2 ;; --pid) pid=$2 ;; esac; shift 2 ;;
+      --wait|--pid|--max-hold) [[ ${2-} =~ ^[0-9]+$ ]] || die "$1 에는 숫자를 주세요: ${2-}"
+        case $1 in --wait) wait=$2 ;; --pid) pid=$2 ;; --max-hold) hold=$2 ;; esac; shift 2 ;;
       --priority) prio=${2-}; q_prio_ok "$prio"; shift 2 ;;
       --base|--note|--lane) case $1 in --base) base=${2-} ;; --note) note=${2-} ;; --lane) lane=${2-} ;; esac; shift 2 ;;
       -*) die "알 수 없는 옵션: $1" ;;
@@ -580,8 +582,10 @@ cmd_queue() {
     case $kind in merge|train|release) ;; *) die "kind 는 merge·train·release 중 하나: ${kind:-(없음)}" ;; esac
     # --pid 필수: 기본값($PPID)은 $(wt queue enter …) 서브셸이라 곧 끝나 번호표가 바로 지워진다.
     [ -n "$pid" ] || { printf 'wt: 사용법: wt queue enter <kind> --pid <차례를 쥘 프로세스, 보통 $$> […]\n' >&2; exit 2; }
+    # init(1)·끝난 pid는 받지 않는다(init은 끝나지 않아 차례가 풀리지 않는다).
+    { [ "$pid" -gt 1 ] && ps -p "$pid" >/dev/null 2>&1; } || { printf 'wt: --pid %s 는 살아 있는 프로세스(1보다 큰 pid)여야 합니다\n' "$pid" >&2; exit 2; }
     [ -n "$prio" ] || { prio=normal; [ "$kind" = release ] && prio=release; }
-    q_enter "$base" "$kind" "$prio" "$pid" "$lane" "$note" || die "origin에 번호표를 만들지 못했습니다(네트워크·권한)"
+    q_enter "$base" "$kind" "$prio" "$pid" "$lane" "$note" $((wait + hold)) || die "origin에 번호표를 만들지 못했습니다(네트워크·권한)"
     local rc=0; q_wait "$(q_base "$base")" "${WT_Q_REF##*/}" "$wait" || rc=$?
     case $rc in
       # 번호표와 갱신은 남긴다: --pid가 살아 있는 동안 갱신되고, 끝나면 갱신이 지운다(보통은 wt queue leave로 놓는다).
@@ -591,13 +595,17 @@ cmd_queue() {
     esac
     return
   fi
-  local qb t hid rows id ct subj i=0 now lane2 mark; qb=$(q_base "$base"); WT_Q_USED=1; now=$(date +%s)
+  local qb t hid hct rows id ct subj i=0 now lane2 mark; qb=$(q_base "$base"); WT_Q_USED=1; now=$(date +%s)
   t=$(q_scan "$qb" "") || die "origin에서 대기열을 읽지 못했습니다"
-  hid=${t%% *}; rows=$(printf '%s\n' "$t" | sed 1d)
+  read -r hid _ hct <<<"${t%%$'\n'*}"; rows=$(printf '%s\n' "$t" | sed 1d)
   echo "머지 대기열 $base:"
   [ -n "$rows" ] || { echo "  비어 있음"; return; }
   while IFS=$'\t' read -r id ct subj; do
-    i=$((i + 1)); mark=""; [ "$id" = "$hid" ] && mark=" [차례]"
+    i=$((i + 1)); mark=""
+    if [ "$id" = "$hid" ]; then
+      mark=" [차례]"; [ $((now - hct)) -le 3600 ] || mark=" [차례 $(((now - hct) / 60))분째 쥠 — 오래 쥔 차례]"
+    fi
+    [ $((now - ct)) -le $((3 * ${WT_QUEUE_BEAT:-60})) ] || mark+=" [갱신 멈춤 $(((now - ct) / 60))분]"
     lane2=$(q_field lane "$subj"); [ "$lane2" != - ] || lane2=""
     printf '  %d. %s  %s  %s %s (%s분째)%s  %s  %s\n' $i "$(q_field priority "$subj")" "$(q_field host "$subj")" "$(q_field kind "$subj")" \
       "$lane2" $(((now - ${id%%-*} / 1000) / 60)) "$mark" "refs/wt-queue/$qb/$id" "${subj#*note=}"
@@ -811,6 +819,7 @@ cmd_finish() {
       # 차례를 받은 뒤 origin/<기준>을 다시 받아 검증한 기준 그대로인지 본다. 움직였으면 차례를 쥔 채 다시 올려 검증한다 —
       # 검증하지 않은 조합을 머지하지 않게. 대기열 밖에서 계속 push하는 곳이 있으면 5번 뒤 멈춘다.
       queue_turn "$base" merge "$prio" "$branch" "$wait"
+      q_old_claim_wait "${WT_Q_REF%/*}"   # 옛 판 호환, 다음 판에서 제거. 기다린 뒤 아래에서 기준을 다시 받는다
       local try=1
       while :; do
         git fetch --quiet origin "$base" || die "origin/$base 를 받지 못했습니다(네트워크). 워크트리는 남겨 둠"
@@ -948,6 +957,7 @@ cmd_train() {
       local tb subject body pr state
       # 묶음 하나가 번호표 하나. 차례를 받은 뒤 기준이 움직였으면 다시 쌓지 않고 멈춘다(아무것도 push하지 않았고 레인은 그대로).
       queue_turn "$base" train "$prio" "" "$wait" "${names# }"
+      q_old_claim_wait "${WT_Q_REF%/*}"   # 옛 판 호환, 다음 판에서 제거. 기다린 뒤 아래에서 기준을 다시 받는다
       git fetch --quiet origin "$base"
       git merge-base --is-ancestor "$upstream" "$tip" \
         || die "검증하는 사이 ${upstream}이 움직여 머지하지 않았습니다. 레인은 그대로입니다. wt train을 다시 실행하세요(다시 쌓아 검증합니다)"
