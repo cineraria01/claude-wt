@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | `wt unclaim <이름> <sha>` | 저장소 안 어디서나 | 선점이 아직 그 sha일 때만 지운다(이미 없으면 0, 다른 sha면 1) |
 | `wt claims` | 저장소 안 어디서나 | origin의 선점 목록(이름·선점자·나이) |
 | `wt queue [--base <브랜치>]` | 저장소 안 어디서나 | 머지 대기열 목록(6-2절): 순번·등급·host·kind·레인·나이·`[차례]`·번호표 ref·메모 |
-| `wt queue enter <merge\|train\|release> [--priority …] [--wait <초>] [--pid <pid>] [--note <글>] [--base <브랜치>] [--lane <이름>]` | 저장소 안 어디서나 | 번호표를 받아 차례를 기다린다. 종료 코드 0 + 번호표 ref(차례를 쥔 채 끝남), 3 시간 초과(번호표는 지움), 1 실패 |
+| `wt queue enter <merge\|train\|release> [--priority …] [--wait <초>] --pid <pid> [--note <글>] [--base <브랜치>] [--lane <이름>]` | 저장소 안 어디서나 | 번호표를 받아 차례를 기다린다. `--pid`(차례를 쥘 프로세스, 보통 스크립트의 `$$`)는 필수. 종료 코드 0 + 번호표 ref(차례를 쥔 채 끝남, 그 pid가 살아 있는 동안 갱신), 3 시간 초과(번호표는 지움), 2 `--pid` 없음, 1 실패 |
 | `wt queue leave <번호표 ref>` | 저장소 안 어디서나 | 번호표를 지우고, 차례를 쥐고 있었으면 놓는다(이미 없으면 0) |
 
 ## 5. `wt finish` 순서
@@ -70,12 +70,13 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 5. `origin/<base>` 위로 rebase. 충돌이면 중단 → 그 워크트리에서 풀고 `git rebase --continue` → 검증 → finish 재실행.
    - 기준이 이미 들어 있으면 rebase하지 않는다. 레인 안에 합치기 커밋이 있으면(여러 레인을 합친 통합 레인) rebase 대신 기준을 merge로 받는다. rebase는 합치기를 한 줄로 다시 쌓아 이미 푼 충돌을 또 내기 때문이다. squash 머지라 결과는 같다. merge 충돌이면 풀고 `git commit` → 검증 → finish 재실행.
 6. `.claude/wt-verify.sh`가 있으면 실행. 실패하면 머지하지 않는다. rebase 뒤 트리가 `wt verify`(또는 앞선 finish)가 통과시킨 트리와 같으면 건너뛴다(`WT_FORCE_VERIFY=1`이면 늘 실행).
+   - 주의: GitHub 원격이면 rebase·검증을 줄 밖에서 하므로, 같은 기계에서 finish 여럿이 함께 다시 검증해야 하면 검증이 동시에 돈다. 부하에 민감한 시험이 있으면 레인을 `wt verify`로 마쳐 finish가 검증을 건너뛰게 하거나 `wt train`으로 묶는다.
 7. GitHub 원격 + `gh`가 있으면: **머지 번호표**(6-2절, kind `merge`, `--priority`) → 차례 기다림(1분마다 `머지 순번 k/n · 앞: <host> <레인 또는 kind>(m분째)`) → **차례를 받은 뒤 재확인**(아래) → push(`--force-with-lease`) → PR 생성(없을 때) → **squash 머지**(`--match-head-commit <검증한 커밋>`) → 상태가 `MERGED`인지 확인 → 번호표 지움 → 원격 브랜치 삭제.
    - 차례를 받은 뒤 재확인: GitHub는 같은 줄 충돌만 막으므로 기다리는 사이 앞 작업이 머지한 기준 위에 검증하지 않은 조합이 들어갈 수 있다. 그래서 차례를 받으면 `origin/<base>`를 다시 받는다. 레인이 이미 그것을 포함하면 머지한다. 움직였으면 **차례를 쥔 채** 다시 rebase(충돌이면 5번 문장으로 멈추고 번호표를 놓음) → 트리가 검증 기록과 다르면 다시 검증 → 다시 확인. 대기열 밖에서 계속 push하는 곳이 있어 5번 넘게 움직이면 "계속 움직여 머지하지 못했습니다"로 멈춘다(워크트리는 남는다). push 직전에 차례를 아직 쥐고 있는지(낡은 것으로 넘겨받히지 않았는지) 본다.
    - 차례가 `--wait`(기본 3600초) 안에 오지 않으면 종료 코드 3으로 끝난다(워크트리는 남는다). 어떻게 끝나든(실패·Ctrl-C·시간 초과) 번호표를 지운다.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.
 8. 하네스가 건 `claude agent …` 잠금만 풀고 워크트리·로컬 브랜치 삭제.
-9. 메인 폴더가 그 기준 브랜치에 있으면 `origin/<base>`로 fast-forward.
+9. 메인 폴더가 그 기준 브랜치에 있으면 `origin/<base>`로 fast-forward. 머지는 이미 끝났으므로 이 단계의 받기가 실패하면 한 번 다시 시도하고, 그래도 안 되면 경고만 낸다(실패로 끝내지 않는다).
 
 ## 5-1. `wt train` — 여러 레인을 한 번에
 
@@ -131,8 +132,10 @@ trap 'wt unclaim "release-v$version" "$claim"' EXIT
 - **번호표** = origin의 `refs/wt-queue/<기준>/<번호>`(기준의 `/`는 `_`). 번호는 `<UTC 밀리초 13자리>-<host>-<pid>`라 이름이 겹치지 않고 문자열 순서가 받은 순서다. 부모 없는 빈 커밋을 빈 lease로 만든다. 제목 한 줄 `wt-queue host=… pid=… at=… kind=merge|train|release priority=critical|release|normal lane=… note=…`.
 - **순서** = 차례를 쥔 번호표가 맨 앞, 나머지는 등급(`critical` → `release` → `normal`) 다음 번호(먼저 받은 순).
 - **차례 쥐기·맨 앞 보호**: 맨 앞이 된 번호표는 `refs/wt-queue/<기준>/_head`(제목 `wt-queue-head ticket=<번호>`)를 빈 lease로 만들어 차례를 쥔다. 서버가 원자적으로 판정하므로 둘이 동시에 맨 앞이라 판단해도 하나만 쥔다. 쥔 뒤에는 등급이 더 높은 번호표가 와도 그 일이 끝날 때까지 기다린다(끼어들기는 기다리는 줄 안에서만).
-- **살아 있음**: 기다리는 동안과 finish·train이 차례를 쥔 동안 1분마다 번호표를 새 커밋 시각으로 다시 올린다. `wt queue enter`는 차례를 받고 끝나면 갱신을 멈춘다(그 뒤는 아래 나이로 판정).
-- **낡은 번호표**: 같은 host에서 그 pid가 끝났으면 바로, 다른 host는 마지막 갱신이 merge·train 30분·release 90분보다 오래됐으면 경고 한 줄(`경고: 낡은 번호표를 지웁니다(<기준>/<번호>): …`) 뒤 그 sha에 lease를 건 삭제. 차례를 쥔 번호표도 같다. `_head`가 가리키는 번호표가 없어지면 `_head`도 지운다(차례가 풀린다).
+- **살아 있음**: 번호표의 pid(finish·train은 wt 자신, `wt queue enter`는 `--pid`)가 살아 있는 동안 백그라운드 갱신이 1분(`WT_QUEUE_BEAT`)마다 번호표를 새 커밋 시각으로 다시 올린다. `wt queue enter`가 차례를 받고 끝나도 갱신은 남아 `--pid`를 지켜본다. 그 pid가 끝나면 갱신이 번호표와 그 차례(`_head`)를 지운다(강제 종료돼도 다음 주기에 풀린다). push가 실패하면 origin을 다시 보고, 아직 자기 번호표면 다음 주기에 다시 시도하고, 없어졌거나 바뀌었으면(`wt queue leave`·넘겨받힘) 끝난다.
+- **낡은 번호표**: 마지막 갱신이 30분보다 오래됐거나(kind와 관계없이), 같은 host에서 그 pid가 끝났고 마지막 갱신이 갱신 주기의 3배보다 오래됐으면 경고 한 줄(`경고: 낡은 번호표를 지웁니다(<기준>/<번호>): …`) 뒤 그 sha에 lease를 건 삭제. 갱신이 신선한 번호표는 pid로 지우지 않는다(host 이름이 같은 다른 기계를 잘못 지우지 않게). 차례를 쥔 번호표도 같다. `_head`가 가리키는 번호표가 없어지면 `_head`도 지운다(차례가 풀린다).
+- **시계**: 번호와 나이가 시각이므로 기계 시계(NTP)가 맞아야 한다.
+- **옛 판 호환**(다음 판에서 제거): 대기열 이전 판의 finish·train은 `refs/wt-claims/merge-<기준>` 선점으로 머지한다. 차례를 쥔 쪽은 push 직전에 그 선점이 살아 있으면(15분 안, 같은 host면 pid도 살아 있음) 최대 20분 기다린다.
 - 기다리는 쪽은 1분마다 `▸ 머지 순번 k/n · 앞: <host> <레인 또는 kind>(m분째)`를 낸다.
 - 브랜치가 아니므로 PR·브랜치 목록에 보이지 않는다. `wt queue`로 본다:
 
@@ -156,7 +159,8 @@ git push --atomic origin HEAD:main "refs/tags/v$version"
 wt queue leave "$ticket"; trap - EXIT
 ```
 
-- `--pid $$`: 스크립트가 강제 종료되면 같은 기계에서는 바로, 다른 기계에서는 90분 뒤 넘겨받는다. 공개가 90분을 넘길 수 있으면 나눠서 차례를 받는다.
+- `--pid $$`(필수): 스크립트가 살아 있는 동안 번호표가 갱신되므로 공개가 오래 걸려도 넘겨받히지 않는다. 스크립트가 끝나면(강제 종료 포함) 갱신이 1분 안에 번호표를 지운다. 기본값을 두지 않는 까닭: `$(wt queue enter …)`의 부모는 곧 끝나는 서브셸이다.
+- 에이전트(Claude 등)가 finish·train·enter를 부를 때는 기본 대기 60분이 도구 한 번의 실행 상한(보통 10분)을 넘을 수 있으니 백그라운드로 돌리고 끝을 기다린다.
 - 급한 수정은 `wt finish --priority critical`(기다리는 줄에서 맨 앞으로, 차례를 쥔 작업은 끝까지 둔다).
 
 ## 7. 훅 세 개
@@ -263,7 +267,7 @@ wt finish --title "..."    # 워크트리 안에서
 | 메인 폴더에서 Edit가 거부됨 | `wt start <슬러그>` 후 워크트리에서 편집 |
 | 재개·압축 뒤 내 워크트리를 이어 씀 | 그 안에서 `wt claim` (주인이 끝난 게 확실할 때만 `--force`) |
 | finish가 "다른 finish·train이 머지 중" | 기다린다. 쥔 쪽이 끝나면(강제 종료 포함) 바로 이어진다 |
-| finish가 "머지 순번 k/n · 앞: …" | 다른 기계·세션이 머지·공개 중이다. 기다린다. 오래 멈춰 있으면 `wt queue`로 앞 번호표를 보고, 그 작업이 끝난 게 확실하면 `wt queue leave <번호표 ref>`(아니면 낡은 번호표는 30·90분 뒤 저절로 풀린다) |
+| finish가 "머지 순번 k/n · 앞: …" | 다른 기계·세션이 머지·공개 중이다. 기다린다. 오래 멈춰 있으면 `wt queue`로 앞 번호표를 보고, 그 작업이 끝난 게 확실하면 `wt queue leave <번호표 ref>`(아니면 주인 프로세스가 끝난 번호표는 1분, 갱신이 멈춘 번호표는 30분 뒤 저절로 풀린다) |
 | finish가 "계속 움직여 머지하지 못했습니다" | 대기열 밖에서 기준에 잇달아 push하는 곳이 있다(대기열을 쓰지 않는 스크립트 등). 잠시 뒤 `wt finish` 재실행 |
 | finish가 종료 코드 3 "머지 순번을 N분 기다렸지만" | 앞 작업이 오래 걸리는 중이다. `wt queue`로 확인하고 다시 실행(`--wait <초>`로 더 기다릴 수 있다) |
 | 병렬 레인이 여럿 함께 끝남 | 레인마다 finish 대신 `wt train <레인>...`(검증 한 번). 종료 코드 3이면 출력된 남은 레인을 그 워크트리에서 `wt finish` |

@@ -20,7 +20,8 @@
 
 **끝낼 때**
 - 커밋 → 저장소 검증 → 워크트리 안에서 `wt finish [--title "..."]` → `ExitWorktree(action="keep")`. finish가 rebase → `.claude/wt-verify.sh`(있으면) → push → PR → **squash 머지** → 브랜치·워크트리 삭제 → 메인 폴더 fast-forward까지 한다(원격이 없거나 GitHub가 아니면 로컬 squash). 동시에 끝나면 GitHub 원격은 origin의 머지 대기열(`wt queue`, 기계·세션 공용), 그 밖은 이 기계의 잠금으로 차례로 머지한다. 차례를 받은 뒤 기준이 움직였으면 차례를 쥔 채 다시 rebase·검증한 뒤 머지한다. 급한 수정은 `wt finish --priority critical`. 기다림이 `--wait`(기본 60분)을 넘으면 종료 코드 3으로 끝나고 워크트리는 남으니, `wt queue`로 앞 작업을 보고 다시 실행한다.
-- 기본 브랜치에 직접 push하는 스크립트(공개 등)는 `wt queue enter release --pid $$`로 차례를 받은 뒤에 기준을 받고, push까지 쥐었다가 `wt queue leave <번호표>`로 놓는다.
+- 기본 브랜치에 직접 push하는 스크립트(공개 등)는 `wt queue enter release --pid $$`로 차례를 받은 뒤에 기준을 받고, push까지 쥐었다가 `wt queue leave <번호표>`로 놓는다(`--pid`는 필수, 그 pid가 끝나면 번호표가 저절로 지워진다).
+- 에이전트로 finish·train을 부를 때 차례 대기(기본 60분)가 도구 실행 상한을 넘을 수 있으니 백그라운드로 돌리고 완료를 기다린다.
 - `wt-verify.sh`가 없는 저장소에서 main이 그사이 움직였으면 rebase 뒤 검증을 직접 다시 돌리고 finish한다.
 - finish가 rebase 충돌·검증 실패로 멈추면 그 워크트리에서 고쳐 다시 실행한다. 강제 해결·검증 생략은 하지 않는다. 충돌을 풀었으면 `wt verify` 후 `wt finish`(코드가 같으면 finish가 같은 검증을 건너뛴다). 머지 차단(보호 규칙·체크)은 사용자에게 보고한다.
 - finish 뒤 원격 브랜치를 손으로 다시 지우지 않는다(이미 지워져 있다).
