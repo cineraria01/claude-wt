@@ -9,6 +9,11 @@
 #   wt gc [--apply]                      이미 기준에 반영된 워크트리·브랜치 정리(기본은 목록만)
 #   wt overlap                           (워크트리 안에서) 다른 레인·기준과 미리 합쳐 본 충돌 예고
 #   wt claim [--force]                   (워크트리 안에서) 이 세션이 이 워크트리를 맡는다(재개·인계)
+#   wt claim <이름> [--wait <초>] [--stale <초>] [--pid <pid>] [--note <글>]
+#                                        기계 간 선점: origin에 refs/wt-claims/<이름>을 없을 때만 만든다
+#                                        0 + sha | 3 + 선점자 줄(sha=… host=… pid=… at=… note=…) | 1 네트워크·권한·origin 없음
+#   wt unclaim <이름> <sha>              원격 선점이 아직 그 sha일 때만 지운다(없으면 0, 다른 sha면 1)
+#   wt claims                            origin의 선점 목록(이름·선점자·나이)
 #
 # 기준: start --base가 branch.<브랜치>.wtBase 에 남긴다(없으면 기본 브랜치). list·gc·finish·overlap이 그것을 쓴다.
 # gc가 지우지 않는 브랜치: 기본 브랜치, 어떤 레인의 기준, 원격이 로컬보다 앞선 브랜치, git config wt.protect "v2 release/*"
@@ -31,10 +36,16 @@ say() { printf '▸ %s\n' "$*" >&2; }
 git() ( exec 9>&-; exec git "$@" )
 gh() ( exec 9>&-; exec gh "$@" )
 
-# 끝날 때(die 포함) train의 임시 통합 워크트리를 치운다. 머지 잠금은 프로세스가 끝나면 OS가 푼다(take_lock).
+# 끝날 때(die·Ctrl-C 포함) 쥐고 있는 머지 선점(merge_claim)을 풀고 train의 임시 통합 워크트리를 치운다.
+# 머지 잠금은 프로세스가 끝나면 OS가 푼다(take_lock). 신호로 끝날 때도 EXIT 트랩이 돌도록 exit으로 바꾼다.
 WT_TMP_WT="" WT_ROOT=""
-on_exit() { [ -z "$WT_TMP_WT" ] || git -C "$WT_ROOT" worktree remove --force "$WT_TMP_WT" 2>/dev/null || true; }
+on_exit() {
+  merge_unclaim 2>/dev/null || true
+  [ -z "$WT_TMP_WT" ] || git -C "$WT_ROOT" worktree remove --force "$WT_TMP_WT" 2>/dev/null || true
+}
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 git_common_dir() { (cd "$(git rev-parse --git-common-dir)" && pwd -P); }
 main_root() { git worktree list --porcelain | sed -n '1s/^worktree //p'; }
@@ -264,6 +275,133 @@ cmd_claim() {
   write_owner "$me"; say "이 세션이 $me 를 맡습니다"
 }
 
+# ── 기계 간 선점(origin의 refs/wt-claims/<이름>) ───────────────
+# 머지 잠금(flock)은 한 기계 안에서만 줄을 세운다. 여러 기계가 같은 원격에 머지·공개하면 이 선점으로 줄을 세운다.
+# 선점 = 부모 없는 빈 트리 커밋(본문 "host=… pid=… at=… note=…")을 빈 lease(--force-with-lease=<ref>:)로 push.
+# 서버가 "ref가 없을 때만 만들기"를 원자적으로 판정하므로 동시에 시도해도 하나만 잡는다. 해제는 그 sha에 lease를 건 삭제.
+# 낡은 선점(커밋 시각이 --stale초보다 오래됨, 또는 이 기계 host의 끝난 pid)은 경고 뒤 넘겨받는다.
+claim_host() { hostname -s 2>/dev/null || hostname; }
+# claim_read <ref>: 선점을 읽어 C_SHA·C_CT(커밋 시각 초)·C_BODY(host= 줄)를 채운다. 0 있음, 1 없음, 2 조회 실패.
+claim_read() {
+  local tmp="refs/wt-claims-seen/$$" rc=0
+  if git fetch --quiet --no-tags origin "+$1:$tmp" 2>/dev/null; then
+    C_SHA=$(git rev-parse "$tmp") C_CT=$(git log -1 --format=%ct "$tmp")
+    C_BODY=$(git log -1 --format=%B "$tmp" | awk '/^host=/&&!d{print;d=1}')
+    git update-ref -d "$tmp"
+    return 0
+  fi
+  git ls-remote --exit-code origin "$1" >/dev/null 2>&1 || rc=$?
+  [ $rc = 2 ] && return 1
+  return 2
+}
+claim_stale() {
+  local h="" p="" rh='(^| )host=([^ ]*)' rp='(^| )pid=([0-9]+)'
+  [ $(($(date +%s) - ${C_CT:-0})) -gt "$1" ] && return 0
+  [[ $C_BODY =~ $rh ]] && h=${BASH_REMATCH[2]}
+  [[ $C_BODY =~ $rp ]] && p=${BASH_REMATCH[2]}
+  # kill -0은 권한 오류도 실패로 낸다(다른 사용자의 살아 있는 pid를 끝난 것으로 오판).
+  [ -n "$p" ] && [ "$h" = "$(claim_host)" ] && ! ps -p "$p" >/dev/null 2>&1
+}
+# claim_take <이름> <pid> <메모> <낡음 초>: 0 + sha | 3 + 선점자 줄 | 1 실패(네트워크·권한).
+claim_take() {
+  local ref="refs/wt-claims/$1" sha rc n
+  sha=$(GIT_AUTHOR_NAME=wt GIT_AUTHOR_EMAIL=wt GIT_COMMITTER_NAME=wt GIT_COMMITTER_EMAIL=wt \
+    git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt claim $1" \
+    -m "host=$(claim_host) pid=$2 at=$(date -u +%Y-%m-%dT%H:%M:%SZ) note=${3//$'\n'/ }") || return 1
+  for n in 1 2 3; do
+    git push --quiet --porcelain --force-with-lease="$ref:" origin "$sha:$ref" >/dev/null 2>&1 && { echo "$sha"; return 0; }
+    rc=0; claim_read "$ref" || rc=$?
+    [ $rc = 1 ] && continue   # 그사이 풀렸다
+    [ $rc = 0 ] || return 1
+    if claim_stale "$4"; then
+      say "경고: 낡은 선점을 넘겨받습니다($1): sha=$C_SHA $C_BODY"
+      git push --quiet --force-with-lease="$ref:$C_SHA" origin ":$ref" >/dev/null 2>&1 || true
+      continue
+    fi
+    echo "sha=$C_SHA $C_BODY"; return 3
+  done
+  return 1
+}
+# claim_wait <이름> <기다릴 초> <낡음 초> <pid> <메모>: claim_take를 기다릴 초까지 되풀이한다. 종료 코드는 claim_take와 같다.
+claim_wait() {
+  local out rc end now said=""
+  end=$(($(date +%s) + $2))
+  while :; do
+    rc=0; out=$(claim_take "$1" "$4" "$5" "$3") || rc=$?
+    [ $rc = 3 ] || { [ -z "$out" ] || echo "$out"; return $rc; }
+    now=$(date +%s)
+    [ "$now" -lt "$end" ] || { echo "$out"; return 3; }
+    [ -n "$said" ] || { say "선점 $1 을 다른 곳이 쥐고 있어 최대 $2초 기다립니다: $out"; said=1; }
+    sleep $((end - now < 3 ? end - now : 3))
+  done
+}
+# claim_release <이름> <sha>: 0 지움(이미 없음 포함), 1 다른 선점이 쥐고 있음·실패.
+claim_release() {
+  local ref="refs/wt-claims/$1" out cur
+  out=$(git ls-remote origin "$ref") || return 1
+  cur=$(printf '%s\n' "$out" | awk -v r="$ref" '$2==r{print $1}')
+  [ -n "$cur" ] || return 0
+  [ "$cur" = "$2" ] || { say "$ref 은 다른 선점($cur)이 쥐고 있어 남겨 둡니다"; return 1; }
+  git push --quiet --force-with-lease="$ref:$2" origin ":$ref" >/dev/null 2>&1
+}
+claim_name_ok() {
+  [[ ${1-} =~ ^[A-Za-z0-9._-]+$ ]] || die "선점 이름은 영문·숫자·. _ - 만: ${1-}"
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  has_origin || die "origin 원격이 없어 선점할 수 없습니다(선점은 origin의 refs/wt-claims/에 둡니다)"
+}
+
+cmd_claim_ref() {
+  local name="" wait=0 stale=10800 pid=$PPID note=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --wait|--stale|--pid) [[ ${2-} =~ ^[0-9]+$ ]] || die "$1 에는 숫자를 주세요: ${2-}"
+        case $1 in --wait) wait=$2 ;; --stale) stale=$2 ;; --pid) pid=$2 ;; esac; shift 2 ;;
+      --note) note=${2-}; shift 2 ;;
+      -*) die "알 수 없는 옵션: $1" ;;
+      *) [ -z "$name" ] || die "사용법: wt claim <이름> [--wait <초>] [--stale <초>] [--pid <pid>] [--note <글>]"; name=$1; shift ;;
+    esac
+  done
+  claim_name_ok "$name"
+  local rc=0; claim_wait "$name" "$wait" "$stale" "$pid" "$note" || rc=$?
+  [ $rc = 1 ] && die "origin에 선점 $name 을 만들지 못했습니다(네트워크·권한 확인)"
+  exit $rc
+}
+cmd_unclaim() {
+  [ $# = 2 ] || die "사용법: wt unclaim <이름> <sha>"
+  claim_name_ok "$1"
+  claim_release "$1" "$2" || exit 1
+}
+cmd_claims() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  has_origin || die "origin 원격이 없습니다"
+  local ns="refs/wt-claims-seen/$$" r ct body now n=0; now=$(date +%s)
+  git fetch --quiet --no-tags origin "+refs/wt-claims/*:$ns/*" || die "origin에서 선점 목록을 읽지 못했습니다"
+  while read -r r ct; do
+    body=$(git log -1 --format=%B "$r" | awk '/^host=/&&!d{print;d=1}')
+    printf '  %s  %s  (%s분 전)\n' "${r#"$ns"/}" "$body" $(((now - ct) / 60))
+    git update-ref -d "$r"; n=$((n + 1))
+  done < <(git for-each-ref --format='%(refname) %(committerdate:unix)' "$ns/")
+  [ $n -gt 0 ] || echo "  선점 없음"
+}
+
+# finish·train의 머지 직전 선점(GitHub). 검증은 선점 밖에서 하고, 짧은 머지 구간만 쥔다.
+# 머지 구간은 몇 분이면 끝나므로 다른 기계에서 강제 종료로 남은 선점은 15분이 지나면 넘겨받는다.
+WT_CLAIM_NAME="" WT_CLAIM_SHA=""
+merge_claim() {
+  local name="merge-${1//\//_}" out rc=0
+  out=$(claim_wait "$name" 1200 900 $$ "wt merge") || rc=$?
+  case $rc in
+    0) WT_CLAIM_NAME=$name WT_CLAIM_SHA=$out ;;
+    3) die "머지 선점 $name 을 20분 동안 얻지 못했습니다($out). wt claims 로 확인한 뒤 다시 실행하세요. 워크트리는 남겨 둠" ;;
+    *) die "머지 선점 $name 을 만들지 못했습니다(origin 네트워크·권한). 워크트리는 남겨 둠" ;;
+  esac
+}
+merge_unclaim() {
+  [ -n "$WT_CLAIM_SHA" ] || return 0
+  claim_release "$WT_CLAIM_NAME" "$WT_CLAIM_SHA" || say "경고: 머지 선점 $WT_CLAIM_NAME 을 풀지 못했습니다(wt unclaim $WT_CLAIM_NAME $WT_CLAIM_SHA)"
+  WT_CLAIM_NAME="" WT_CLAIM_SHA=""
+}
+
 # 새 워크트리 준비: .worktreeinclude의 gitignore 파일 사본 + .claude/wt-setup.sh. start와 train(통합 워크트리)이 쓴다.
 prepare_worktree() {
   local root=$1 dir=$2
@@ -402,6 +540,31 @@ sync_main() {
   fi
 }
 
+# 레인을 기준 위로 올린다. 레인 안에 합치기 커밋이 있으면 rebase가 커밋을 한 줄로 다시 쌓아 이미 푼 충돌을 또 낸다
+# (기준이 그대로여도). squash 머지라 결과는 같으니 기준을 merge로 받는다.
+onto_upstream() {
+  local upstream=$1 dir=$2 branch=$3
+  if git merge-base --is-ancestor "$upstream" HEAD; then
+    say "${upstream}이 이미 들어 있어 rebase 없이 진행합니다"
+  elif [ -n "$(git rev-list --merges "$upstream..HEAD")" ]; then
+    say "합치기 커밋이 있는 레인이라 rebase 대신 ${upstream}을 merge합니다"
+    git merge --quiet --no-edit "$upstream" || die "merge 충돌. 이 워크트리($dir)에서 풀고 git commit → wt verify → wt finish 재실행"
+  else
+    say "rebase: $branch → $upstream"
+    git rebase --quiet "$upstream" || die "rebase 충돌. 이 워크트리($dir)에서 풀고 git rebase --continue → wt verify → wt finish 재실행"
+  fi
+}
+# 검증 기록(wt-verified)의 트리와 다르면 .claude/wt-verify.sh를 돌린다.
+verify_if_changed() {
+  [ -x .claude/wt-verify.sh ] || return 0
+  local tree; tree=$(git rev-parse 'HEAD^{tree}')
+  if [ "${WT_FORCE_VERIFY:-}" != 1 ] && [ "$(cat "$(verified_file)" 2>/dev/null)" = "$tree" ]; then
+    say "이미 검증한 코드와 같아 검증을 건너뜁니다(트리 $(git rev-parse --short "$tree"), 다시 돌리려면 WT_FORCE_VERIFY=1)"
+  else
+    run_verify || die "검증 실패. 고친 뒤 커밋하고 wt finish 재실행"
+  fi
+}
+
 cmd_finish() {
   local title=""
   while [ $# -gt 0 ]; do
@@ -433,27 +596,24 @@ cmd_finish() {
   if [ "$(git rev-list --count "$upstream..HEAD")" = 0 ]; then
     say "${base}에 새로 들어갈 커밋이 없습니다. 정리만 합니다"
   else
-    # 레인 안에 합치기 커밋이 있으면 rebase가 커밋을 한 줄로 다시 쌓아 이미 푼 충돌을 또 낸다
-    # (기준이 그대로여도). squash 머지라 결과는 같으니 기준을 merge로 받는다.
-    if git merge-base --is-ancestor "$upstream" HEAD; then
-      say "${upstream}이 이미 들어 있어 rebase 없이 진행합니다"
-    elif [ -n "$(git rev-list --merges "$upstream..HEAD")" ]; then
-      say "합치기 커밋이 있는 레인이라 rebase 대신 ${upstream}을 merge합니다"
-      git merge --quiet --no-edit "$upstream" || die "merge 충돌. 이 워크트리($dir)에서 풀고 git commit → wt verify → wt finish 재실행"
-    else
-      say "rebase: $branch → $upstream"
-      git rebase --quiet "$upstream" || die "rebase 충돌. 이 워크트리($dir)에서 풀고 git rebase --continue → wt verify → wt finish 재실행"
-    fi
-    if [ -x .claude/wt-verify.sh ]; then
-      local tree; tree=$(git rev-parse 'HEAD^{tree}')
-      if [ "${WT_FORCE_VERIFY:-}" != 1 ] && [ "$(cat "$(verified_file)" 2>/dev/null)" = "$tree" ]; then
-        say "이미 검증한 코드와 같아 검증을 건너뜁니다(트리 $(git rev-parse --short "$tree"), 다시 돌리려면 WT_FORCE_VERIFY=1)"
-      else
-        run_verify || die "검증 실패. 고친 뒤 커밋하고 wt finish 재실행"
-      fi
-    fi
+    onto_upstream "$upstream" "$dir" "$branch"
+    verify_if_changed
 
     if is_github && type -P gh >/dev/null; then
+      # 다른 기계의 finish·train과 머지를 한 줄로 세운다(flock은 이 기계 안에서만). 선점한 뒤 origin/<기준>을 다시 받아
+      # 검증한 기준 그대로인지 본다. 움직였으면 선점을 내려놓고 다시 올려 검증한다 — 검증하지 않은 조합을 머지하지 않게.
+      local try=1
+      while :; do
+        merge_claim "$base"
+        git fetch --quiet origin "$base"
+        git merge-base --is-ancestor "$upstream" HEAD && break
+        merge_unclaim
+        [ $try -lt 5 ] || die "${base}가 계속 움직여 머지하지 못했습니다. 잠시 뒤 wt finish를 다시 실행하세요. 워크트리는 남겨 둠"
+        try=$((try + 1))
+        say "검증하는 사이 ${upstream}이 움직였습니다. 다시 올려 검증합니다(${try}/5)"
+        onto_upstream "$upstream" "$dir" "$branch"
+        verify_if_changed
+      done
       local msg subject body pr state
       msg=$(squash_message "$upstream" "$title")
       # head -1 파이프는 긴 메시지에서 printf가 SIGPIPE(141)로 죽어 pipefail에 걸린다
@@ -468,10 +628,12 @@ cmd_finish() {
         pr=$(gh pr list --head "$branch" --base "$base" --state open --json number --jq '.[0].number')
       fi
       say "PR #$pr squash 머지"
-      gh pr merge "$pr" --squash --subject "$subject" --body "$body" \
+      # --match-head-commit: 검증한 커밋이 아닌 것(그사이 다른 곳에서 레인 브랜치에 push)은 머지하지 않는다.
+      gh pr merge "$pr" --squash --match-head-commit "$(git rev-parse HEAD)" --subject "$subject" --body "$body" \
         || die "머지 실패(보호 규칙·체크 등). PR #$pr 을 확인하세요. 워크트리는 남겨 둠"
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 워크트리는 남겨 둠"
+      merge_unclaim
       git push --quiet origin --delete "$branch" 2>/dev/null || true
     else
       # 원격이 없거나 GitHub가 아닌 저장소: 로컬 squash 후 base를 fast-forward.
@@ -573,6 +735,11 @@ cmd_train() {
     for i in $stacked; do names+=" ${branches[$i]#wt/}"; done
     if is_github && type -P gh >/dev/null; then
       local tb subject body pr state
+      # finish와 같은 머지 직전 재확인. 움직였으면 다시 쌓지 않고 멈춘다(아무것도 push하지 않았고 레인은 그대로).
+      merge_claim "$base"
+      git fetch --quiet origin "$base"
+      git merge-base --is-ancestor "$upstream" "$tip" \
+        || die "검증하는 사이 ${upstream}이 움직여 머지하지 않았습니다. 레인은 그대로입니다. wt train을 다시 실행하세요(다시 쌓아 검증합니다)"
       tb="wt/train-$(date +%Y%m%d-%H%M%S)-$$"
       subject=${title:-"train:$names"}
       body=$(git -C "$WT_TMP_WT" log --reverse --format='* %s' "$upstream..HEAD")
@@ -584,12 +751,13 @@ cmd_train() {
         && [[ $pr =~ ^[0-9]+$ ]] \
         || { git push --quiet origin --delete "$tb" 2>/dev/null || true; die "PR을 만들지 못했습니다(번호 확인 실패: ${pr-}). 레인은 그대로입니다"; }
       say "PR #$pr rebase 머지(레인마다 커밋 하나)"
-      if ! gh pr merge "$pr" --rebase; then
+      if ! gh pr merge "$pr" --rebase --match-head-commit "$tip"; then
         gh pr close "$pr" --delete-branch >/dev/null 2>&1 || true
         die "머지 실패(rebase 머지 허용 여부·보호 규칙·체크 등). PR #$pr 은 닫았습니다. 레인은 그대로 — 레인마다 wt finish"
       fi
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 레인 워크트리는 남겨 둠"
+      merge_unclaim
       git push --quiet origin --delete "$tb" 2>/dev/null || true
     else
       if has_origin; then
@@ -725,7 +893,10 @@ case ${1-} in
   list|ls) shift; cmd_list "$@" ;;
   gc) shift; cmd_gc "$@" ;;
   overlap) shift; cmd_overlap "$@" ;;
-  claim) shift; cmd_claim "$@" ;;
+  # 인자가 없거나 --force면 워크트리 맡기, 이름이 있으면 기계 간 선점.
+  claim) shift; if [ $# = 0 ] || [ "$1" = --force ]; then cmd_claim "$@"; else cmd_claim_ref "$@"; fi ;;
+  unclaim) shift; cmd_unclaim "$@" ;;
+  claims) shift; cmd_claims "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   *) awk 'NR>1 && /^set -e/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 1 ;;
 esac
