@@ -547,6 +547,40 @@ check "1시간 넘게 쥔 차례 표시" has "$(wq 2>&1)" "[차례 66분째 쥠 
 git -C "$GR" push -q origin ":refs/wt-queue/main/_head" ":refs/wt-queue/main/$O5"
 check "  └ 대기열 비움" qgone
 
+echo "⑫-7 기계 간 같은 이름 레인: start 거부·finish가 남의 브랜치를 덮어쓰지 않음"
+OC="$T/othermachine"; git clone -q "$G" "$OC"
+opush() { (cd "$OC" && git fetch -q origin && git checkout -q -B "$1" origin/main && echo "$2" >"$2.txt" && git add -A && git commit -qm "$2" && git push -q -f origin "$1"); }
+opush wt/dup dup-o
+rc=0; out=$(cd "$GR" && "$WT" start dup 2>&1) || rc=$?
+check "(a) 원격에 같은 wt/<슬러그>가 있으면 start 거부" bash -c "[ $rc = 1 ] && [ ! -e '$GR.wt/dup' ] && ! git -C '$GR' show-ref --verify --quiet refs/heads/wt/dup"
+check "  └ 다른 기계 안내" has "$out" "다른 기계"
+B7=$(gstart b7); echo mine >"$B7/b7.txt"; commit "$B7" "b7 mine"
+opush wt/b7 b7-o; THEIRS=$(git --git-dir="$G" rev-parse refs/heads/wt/b7)
+git -C "$GR" fetch -q origin   # 이 기계가 남의 브랜치를 받아 둔 상태 — 기대값 없는 lease면 그것을 기대값으로 덮어쓴다
+rc=0; out=$(cd "$B7" && PATH="$T/bin:$PATH" "$WT" finish 2>&1) || rc=$?
+check "(b) 남의 같은 이름 브랜치가 있으면 finish 중단·덮어쓰지 않음" bash -c "[ $rc = 1 ] && [ \"\$(git --git-dir='$G' rev-parse refs/heads/wt/b7)\" = '$THEIRS' ] && [ -d '$B7' ]"
+check "  └ main에 안 들어감" bash -c "! git --git-dir='$G' cat-file -e main:b7.txt 2>/dev/null"
+check "  └ 이름을 바꿔 다시 시작 안내" has "$out" "새 이름으로 wt start"
+check "  └ 대기열 비움" qgone
+C7=$(gstart c7); echo c7 >"$C7/c7.txt"; commit "$C7" "c7 추가"
+rc=0; (cd "$C7" && PATH="$T/bin:$PATH" GH_FAIL_MERGE=1 "$WT" finish >/dev/null 2>&1) || rc=$?
+check "(c) 첫 finish는 머지 실패로 멈추고 레인 브랜치는 원격에 남음" bash -c "[ $rc = 1 ] && git --git-dir='$G' rev-parse --verify --quiet refs/heads/wt/c7 >/dev/null"
+opush main m7   # 기준이 움직여 다음 finish가 rebase한다 → 원격 레인 브랜치는 HEAD의 조상이 아니다
+rc=0; out=$(cd "$C7" && PATH="$T/bin:$PATH" "$WT" finish 2>&1) || rc=$?
+git -C "$GR" fetch -q origin
+check "(c) rebase 뒤 다시 finish하면 내가 올린 sha를 기대값으로 재푸시·머지" bash -c "[ $rc = 0 ] && git -C '$GR' cat-file -e origin/main:c7.txt && git -C '$GR' cat-file -e origin/main:m7.txt"
+opush wt/d7 d7-o; git -C "$GR" fetch -q origin
+git --git-dir="$G" update-ref -d refs/heads/wt/d7   # 다른 기계가 끝내고 지웠고, 이 기계에는 낡은 origin/wt/d7이 남음
+D7=$(gstart d7); echo d7 >"$D7/d7.txt"; commit "$D7" "d7 추가"
+rc=0; out=$(cd "$D7" && PATH="$T/bin:$PATH" "$WT" finish 2>&1) || rc=$?
+git -C "$GR" fetch -q origin
+check "(d) 원격 브랜치가 없으면(낡은 추적 ref가 있어도) 첫 push·머지" bash -c "[ $rc = 0 ] && git -C '$GR' cat-file -e origin/main:d7.txt"
+git -C "$OC" remote set-url origin "$T/nowhere.git"
+rc=0; out=$(cd "$OC" && "$WT" start off 2>&1) || rc=$?
+check "origin을 못 보면(오프라인) 경고만 하고 start 진행" bash -c "[ $rc = 0 ] && [ -d '$OC.wt/off' ]" && check "  └ 경고" has "$out" "확인하지 못했습니다"
+git --git-dir="$G" update-ref -d refs/heads/wt/dup; git --git-dir="$G" update-ref -d refs/heads/wt/b7
+git -C "$GR" worktree remove --force "$B7"; git -C "$GR" branch -q -D wt/b7
+
 echo "⑦ gc의 24시간 판정은 status가 건드리는 파일을 사용 흔적으로 안 본다"
 OLD=$(start gc-old); FRESH=$(start gc-fresh)
 OGD=$(git -C "$OLD" rev-parse --absolute-git-dir)

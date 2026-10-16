@@ -647,6 +647,15 @@ cmd_start() {
   local branch="wt/$slug" dir; dir="$(dirname "$root")/$(basename "$root").wt/$slug"
   git show-ref --verify --quiet "refs/heads/$branch" && die "브랜치가 이미 있습니다: $branch (wt list)"
   [ -e "$dir" ] && die "폴더가 이미 있습니다: $dir"
+  # 다른 기계가 같은 이름으로 만든 레인과 섞이지 않게: origin에 같은 브랜치가 있으면 거부. 원격을 못 보면 경고만(오프라인).
+  if has_origin; then
+    local rrc=0; git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1 || rrc=$?
+    case $rrc in
+      0) die "origin에 같은 이름의 브랜치가 이미 있습니다: $branch (다른 기계의 레인일 수 있음). 다른 슬러그로 시작하세요" ;;
+      2) ;;
+      *) say "경고: origin에 $branch 가 있는지 확인하지 못했습니다(네트워크). 그대로 진행합니다" ;;
+    esac
+  fi
 
   local from=$base
   if has_origin; then
@@ -664,6 +673,22 @@ cmd_start() {
     printf '%s\n' "$others" >&2
   fi
   echo "$dir"
+}
+
+# 레인 브랜치를 origin에 올린다. 원격에 같은 이름이 있으면 이 레인이 마지막으로 올린 sha(branch.<b>.wtPushed)이거나
+# HEAD의 조상일 때만 그 sha를 기대값으로 덮어쓴다(rebase 뒤 재푸시). 그 밖은 다른 기계의 같은 이름 레인으로 보고 멈춘다.
+# 원격에 없으면 빈 기대값(없을 때만 만들기). 추적 ref(origin/<b>)는 남의 것을 받아 둔 것일 수 있어 기대값으로 쓰지 않는다.
+push_lane() {
+  local b=$1 out remote mine
+  out=$(git ls-remote origin "refs/heads/$b") || die "origin/$b 를 확인하지 못했습니다(네트워크). 워크트리는 남겨 둠"
+  remote=$(printf '%s\n' "$out" | awk -v r="refs/heads/$b" '$2==r{print $1}')
+  mine=$(git config "branch.$b.wtPushed" || true)
+  if [ -n "$remote" ] && [ "$remote" != "$mine" ] && ! git merge-base --is-ancestor "$remote" HEAD 2>/dev/null; then
+    die "origin/$b 가 이 레인이 올린 것이 아닙니다(다른 기계의 같은 이름 레인일 수 있음, $remote). 덮어쓰지 않습니다. 새 이름으로 wt start 해 커밋을 옮긴 뒤 finish하세요. 워크트리는 남겨 둠"
+  fi
+  git push --quiet --force-with-lease="refs/heads/$b:$remote" -u origin "$b" \
+    || die "origin/$b push 실패(그사이 다른 곳이 같은 이름으로 올렸을 수 있음). 워크트리는 남겨 둠"
+  git config "branch.$b.wtPushed" "$(git rev-parse HEAD)"
 }
 
 squash_message() {
@@ -837,7 +862,7 @@ cmd_finish() {
       subject=${msg%%$'\n'*}
       body=$(printf '%s\n' "$msg" | tail -n +3)
       say "push → origin/$branch"
-      git push --quiet --force-with-lease -u origin "$branch"
+      push_lane "$branch"
       pr=$(gh pr list --head "$branch" --base "$base" --state open --json number --jq '.[0].number' 2>/dev/null || true)
       if [ -z "$pr" ]; then
         gh pr create --base "$base" --head "$branch" --title "$subject" \
@@ -851,7 +876,7 @@ cmd_finish() {
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 워크트리는 남겨 둠"
       q_leave
-      git push --quiet origin --delete "$branch" 2>/dev/null || true
+      git push --quiet --force-with-lease="refs/heads/$branch:$(git rev-parse HEAD)" origin --delete "$branch" 2>/dev/null || true
     else
       # 원격이 없거나 GitHub가 아닌 저장소: 로컬 squash 후 base를 fast-forward.
       local msg; msg=$(squash_message "$upstream" "$title")
@@ -966,12 +991,13 @@ cmd_train() {
       subject=${title:-"train:$names"}
       body=$(git -C "$WT_TMP_WT" log --reverse --format='* %s' "$upstream..HEAD")
       say "push → origin/$tb"
-      git push --quiet origin "$tip:refs/heads/$tb"
+      git push --quiet --force-with-lease="refs/heads/$tb:" origin "$tip:refs/heads/$tb" \
+        || die "origin/$tb push 실패(같은 이름이 이미 있거나 네트워크). 레인은 그대로입니다"
       # 번호는 create가 낸 URL에서 받는다. 빈 번호를 gh에 주면 메인 폴더 브랜치의 PR을 대상으로 삼는다.
       pr=$(gh pr create --base "$base" --head "$tb" --title "$subject" \
         --body "$(printf '%s\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' "$body")") && pr=${pr##*/} \
         && [[ $pr =~ ^[0-9]+$ ]] \
-        || { git push --quiet origin --delete "$tb" 2>/dev/null || true; die "PR을 만들지 못했습니다(번호 확인 실패: ${pr-}). 레인은 그대로입니다"; }
+        || { git push --quiet --force-with-lease="refs/heads/$tb:$tip" origin --delete "$tb" 2>/dev/null || true; die "PR을 만들지 못했습니다(번호 확인 실패: ${pr-}). 레인은 그대로입니다"; }
       say "PR #$pr rebase 머지(레인마다 커밋 하나)"
       if ! gh pr merge "$pr" --rebase --match-head-commit "$tip"; then
         gh pr close "$pr" --delete-branch >/dev/null 2>&1 || true
@@ -980,7 +1006,7 @@ cmd_train() {
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 레인 워크트리는 남겨 둠"
       q_leave
-      git push --quiet origin --delete "$tb" 2>/dev/null || true
+      git push --quiet --force-with-lease="refs/heads/$tb:$tip" origin --delete "$tb" 2>/dev/null || true
     else
       if has_origin; then
         git push --quiet origin "$tip:refs/heads/$base" || die "origin/$base 로 push 실패. 레인 워크트리는 남겨 둠"
@@ -1003,7 +1029,7 @@ cmd_train() {
     remove_lane "$d" "$b"
     # 원격 레인 브랜치는 내용이 기준에 다 들어 있을 때만 지운다(다른 곳에서 더 push했을 수 있다).
     if has_origin && git show-ref --verify --quiet "refs/remotes/origin/$b" && content_in_base "$upstream" "origin/$b"; then
-      git push --quiet origin --delete "$b" 2>/dev/null || true
+      git push --quiet --force-with-lease="refs/heads/$b:$(git rev-parse "refs/remotes/origin/$b")" origin --delete "$b" 2>/dev/null || true
     fi
   done
   sync_main "$root" "$base"
