@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 
 | 명령 | 어디서 | 동작 |
 |---|---|---|
-| `wt start <슬러그> [--base <브랜치>]` | 저장소 안 어디서나 | `origin/<base>` fetch → `wt/<슬러그>` 브랜치로 워크트리 생성 → `.worktreeinclude` 복사 → `.claude/wt-setup.sh` 실행 → 소유 표식 기록 → 다른 레인과 겹치는 파일 출력 → 마지막 줄에 경로 출력 |
+| `wt start <슬러그> [--base <브랜치>]` | 저장소 안 어디서나 | origin에 같은 `wt/<슬러그>`가 있으면 거부(다른 기계의 같은 이름 레인일 수 있음, origin을 못 보면 경고만) → `origin/<base>` fetch → `wt/<슬러그>` 브랜치로 워크트리 생성 → `.worktreeinclude` 복사 → `.claude/wt-setup.sh` 실행 → 소유 표식 기록 → 다른 레인과 겹치는 파일 출력 → 마지막 줄에 경로 출력 |
 | `wt finish [--title "..."] [--priority critical\|release\|normal] [--wait <초>]` | 워크트리 안 | 5절 순서로 머지·정리. `--priority`는 머지 대기열 등급(기본 normal), `--wait`은 차례를 기다릴 최대 시간(기본 3600초, 넘으면 종료 코드 3) |
 | `wt train [--title "..."] [--priority …] [--wait <초>] <레인>...` | 저장소 안 어디서나 | 끝난 레인 여럿을 검증 한 번으로 한꺼번에 머지(5-1절). 레인은 슬러그·브랜치·워크트리 경로 |
 | `wt verify` | 워크트리 안 | `.claude/wt-verify.sh` 실행. 통과하면 그 코드의 트리 해시를 기록하고, rebase 뒤에도 트리가 같으면 finish가 검증을 건너뛴다. 미커밋 변경이 있으면 거절 |
@@ -71,8 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
    - 기준이 이미 들어 있으면 rebase하지 않는다. 레인 안에 합치기 커밋이 있으면(여러 레인을 합친 통합 레인) rebase 대신 기준을 merge로 받는다. rebase는 합치기를 한 줄로 다시 쌓아 이미 푼 충돌을 또 내기 때문이다. squash 머지라 결과는 같다. merge 충돌이면 풀고 `git commit` → 검증 → finish 재실행.
 6. `.claude/wt-verify.sh`가 있으면 실행. 실패하면 머지하지 않는다. rebase 뒤 트리가 `wt verify`(또는 앞선 finish)가 통과시킨 트리와 같으면 건너뛴다(`WT_FORCE_VERIFY=1`이면 늘 실행).
    - 주의: GitHub 원격이면 rebase·검증을 줄 밖에서 하므로, 같은 기계에서 finish 여럿이 함께 다시 검증해야 하면 검증이 동시에 돈다. 부하에 민감한 시험이 있으면 레인을 `wt verify`로 마쳐 finish가 검증을 건너뛰게 하거나 `wt train`으로 묶는다.
-7. GitHub 원격 + `gh`가 있으면: **머지 번호표**(6-2절, kind `merge`, `--priority`) → 차례 기다림(1분마다 `머지 순번 k/n · 앞: <host> <레인 또는 kind>(m분째)`) → **차례를 받은 뒤 재확인**(아래) → push(`--force-with-lease`) → PR 생성(없을 때) → **squash 머지**(`--match-head-commit <검증한 커밋>`) → 상태가 `MERGED`인지 확인 → 번호표 지움 → 원격 브랜치 삭제.
+7. GitHub 원격 + `gh`가 있으면: **머지 번호표**(6-2절, kind `merge`, `--priority`) → 차례 기다림(1분마다 `머지 순번 k/n · 앞: <host> <레인 또는 kind>(m분째)`) → **차례를 받은 뒤 재확인**(아래) → push(아래 레인 브랜치 규칙) → PR 생성(없을 때) → **squash 머지**(`--match-head-commit <검증한 커밋>`) → 상태가 `MERGED`인지 확인 → 번호표 지움 → 원격 브랜치 삭제.
    - 차례를 받은 뒤 재확인: GitHub는 같은 줄 충돌만 막으므로 기다리는 사이 앞 작업이 머지한 기준 위에 검증하지 않은 조합이 들어갈 수 있다. 그래서 차례를 받으면 `origin/<base>`를 다시 받는다. 레인이 이미 그것을 포함하면 머지한다. 움직였으면 **차례를 쥔 채** 다시 rebase(충돌이면 5번 문장으로 멈추고 번호표를 놓음) → 트리가 검증 기록과 다르면 다시 검증 → 다시 확인. 대기열 밖에서 계속 push하는 곳이 있어 5번 넘게 움직이면 "계속 움직여 머지하지 못했습니다"로 멈춘다(워크트리는 남는다). push 직전에 차례를 아직 쥐고 있는지(낡은 것으로 넘겨받히지 않았는지) 본다.
+   - 레인 브랜치 push: `git ls-remote`로 원격 sha를 읽는다. 없으면 빈 기대값(`--force-with-lease=<ref>:`, 없을 때만 만들기)으로 올린다. 있으면 이 레인이 마지막으로 올린 sha(`branch.<브랜치>.wtPushed`)이거나 HEAD의 조상일 때만 그 sha를 기대값으로 덮어쓴다(rebase 뒤 재푸시). 그 밖이면 다른 기계의 같은 이름 레인으로 보고 덮어쓰지 않고 멈춘다 — 새 이름으로 `wt start` 해 커밋을 옮긴 뒤 finish한다. 받아 둔 추적 ref(`origin/<브랜치>`)는 남의 것일 수 있어 기대값으로 쓰지 않는다. `wt start`를 거치지 않은 브랜치(하네스의 `worktree-agent-*` 등)도 같다. 머지 뒤 원격 브랜치 삭제도 HEAD를 기대값으로 한다.
    - 차례가 `--wait`(기본 3600초) 안에 오지 않으면 종료 코드 3으로 끝난다(워크트리는 남는다). 어떻게 끝나든(실패·Ctrl-C·시간 초과) 번호표를 지운다.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.
 8. 하네스가 건 `claude agent …` 잠금만 풀고 워크트리·로컬 브랜치 삭제.
@@ -86,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 2. (GitHub가 아니면 잠금을 한 번 잡고) `origin/<base>`에 임시 통합 워크트리(`<저장소>.wt/.train-<pid>`, detached)를 만든다.
 3. 준 순서대로 레인마다 그 순간의 커밋을 `git merge --squash` → 커밋 하나(메시지는 finish의 squash 메시지와 같다). 이름이 아니라 커밋으로 쌓으므로 같은 이름의 태그와 섞이지 않는다. 충돌 나는 레인은 빼고 계속한다. 이미 기준에 들어 있는 레인은 정리만 한다.
 4. 쌓은 결과에 `.worktreeinclude`·`.claude/wt-setup.sh`를 적용하고(의존성을 바꾼 레인도 그 의존성으로 검증되게) `.claude/wt-verify.sh`를 **한 번** 실행한다. 실패하면 아무것도 머지하지 않고 레인을 그대로 둔다 → 레인마다 `wt finish`로 각자 검증·머지.
-5. GitHub 원격 + `gh`면 묶음 하나가 머지 번호표 하나(kind `train`, 메모에 레인 이름)로 finish와 같이 차례를 기다리고, 차례를 받으면 `origin/<base>`를 다시 받는다. 검증하는 사이 움직였으면 아무것도 push하지 않고 멈춘다(종료 코드 1, 번호표는 지움, 레인은 그대로 — `wt train`을 다시 실행하면 새 기준에 다시 쌓아 검증한다). 그대로면 통합 결과를 `wt/train-…` 브랜치로 push → PR → **rebase 머지**(`--match-head-commit`, 레인마다 커밋 하나가 그대로 남는다) → `MERGED` 확인 → 원격 브랜치 삭제. 머지가 막히면(rebase 머지 꺼짐·보호 규칙·필수 체크) PR을 닫고 브랜치를 지운 뒤 멈춘다 — 레인은 그대로이니 레인마다 `wt finish`. 원격이 없거나 GitHub가 아니면 기준 브랜치로 push·fast-forward.
+5. GitHub 원격 + `gh`면 묶음 하나가 머지 번호표 하나(kind `train`, 메모에 레인 이름)로 finish와 같이 차례를 기다리고, 차례를 받으면 `origin/<base>`를 다시 받는다. 검증하는 사이 움직였으면 아무것도 push하지 않고 멈춘다(종료 코드 1, 번호표는 지움, 레인은 그대로 — `wt train`을 다시 실행하면 새 기준에 다시 쌓아 검증한다). 그대로면 통합 결과를 `wt/train-…` 브랜치로 push(빈 기대값 — 같은 이름이 있으면 멈춤) → PR → **rebase 머지**(`--match-head-commit`, 레인마다 커밋 하나가 그대로 남는다) → `MERGED` 확인 → 원격 브랜치 삭제. 머지가 막히면(rebase 머지 꺼짐·보호 규칙·필수 체크) PR을 닫고 브랜치를 지운 뒤 멈춘다 — 레인은 그대로이니 레인마다 `wt finish`. 원격이 없거나 GitHub가 아니면 기준 브랜치로 push·fast-forward.
 6. 통합 워크트리와, 머지된 레인·이미 들어 있던 레인의 워크트리·브랜치를 지우고 메인 폴더를 fast-forward. 원격에도 있던 레인 브랜치는 내용이 기준에 다 들어 있을 때만 지운다. **쌓은 뒤 레인에 새 커밋이나 미커밋 변경이 생겼으면 그 레인은 지우지 않는다**(쌓은 부분은 들어갔고, 남은 변경은 그 워크트리에서 `wt finish`).
 7. 종료 코드: 0 = 모두 머지·정리, 3 = 충돌로 뺐거나 쌓은 뒤 바뀌어 남긴 레인이 있음(목록 출력), 1 = 실패(아무것도 머지 안 함, 또는 머지 단계 오류 안내).
 
