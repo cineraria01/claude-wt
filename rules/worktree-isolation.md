@@ -36,4 +36,4 @@
 - **워크트리를 손으로 지우지 않는다.** `git worktree unlock/remove`, 워크트리 경로 `rm -r`로 정리하지 않고 `wt finish`·`wt gc --apply`만 쓴다. 커밋·변경이 없어 보여도 다른 세션 에이전트가 첫 커밋 전일 수 있다(수동 정리 반복문이 실행 중 에이전트의 잠금을 풀고 지워 작업이 날아간 사례가 있다). 훅 `wt-remove-guard`가 살아 있는 다른 세션의 워크트리(하네스 잠금 pid·wt-owner)를 지우는 명령을 막고, `wt list`는 `[다른 세션 에이전트 실행 중]`, `wt gc`는 `유지(다른 세션 에이전트 잠금)`으로 보여 준다.
 - `wt finish`가 아닌 방법(레인 합본 커밋, cherry-pick, 수동 병합)으로 main에 넣었으면 같은 작업 안에서 `git worktree remove` + `git branch -D`로 지운다. 일부 커밋을 일부러 뺐다면 `wt gc`가 못 잡으니 직접 지우고 이유를 커밋에 남긴다(안 지우면 다음 세션이 이미 들어간 작업을 "미병합"으로 오판한다).
 - 남은 워크트리를 "미병합"으로 보고하기 전에 핵심 변경이 main에 있는지 `git log`/`git grep`으로 대조한다. 있으면 잔재로 보고하고 삭제를 제안한다. 정리는 `wt gc`(목록) → `wt gc --apply`.
-- 저장소별 선택 파일(커밋해 둔다): `.worktreeinclude`(새 워크트리로 복사할 gitignore 파일, 예 `.env`), `.claude/wt-setup.sh`(의존성·빌드 준비), `.claude/wt-verify.sh`(finish 때 검증).
+- 저장소별 선택 파일(커밋해 둔다): `.worktreeinclude`(새 워크트리로 복사할 gitignore 파일, 예 `.env`), `.claude/wt-setup.sh`(의존성·빌드 준비), `.claude/wt-verify.sh`(finish 때 검증), `.claude/wt-teardown.sh`(finish·train·gc가 워크트리를 지우기 직전 정리, 실패해도 정리는 계속).

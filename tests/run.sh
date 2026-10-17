@@ -591,6 +591,26 @@ check "오래된 레인은 status 뒤에도 정리 대상" has "$out" "정리 �
 check "방금 만든 레인은 24시간 내 사용으로 유지" has "$out" "유지(24시간 내 사용) $FRESH"
 git -C "$R" worktree remove --force "$FRESH" 2>/dev/null || true; git -C "$R" branch -D wt/gc-fresh >/dev/null 2>&1 || true
 
+echo "⑧ .claude/wt-teardown.sh: 워크트리를 지우기 직전에 그 안에서 실행, 실패해도 정리는 계속"
+TD_LOG="$T/teardown.log"; : >"$TD_LOG"; export TD_LOG
+(cd "$R" && git pull -q --ff-only origin main \
+  && printf '#!/usr/bin/env bash\necho "$PWD|$WT_MAIN" >>"$TD_LOG"\n[ -z "${TEARDOWN_FAIL-}" ]\n' >.claude/wt-teardown.sh \
+  && chmod +x .claude/wt-teardown.sh && git add -A && git commit -qm teardown && git push -q origin main)
+OLDBASE=$(git -C "$R" rev-parse HEAD~1); git -C "$R" branch -q -f td-old "$OLDBASE"   # 정리 스크립트가 없던 기준
+TD1=$(start td-one); echo x >"$TD1/td1.txt"; commit "$TD1" "td1"
+(cd "$TD1" && "$WT" finish >/dev/null 2>&1) || true
+check "finish가 지우기 전에 그 워크트리 안에서 실행(WT_MAIN=메인 폴더)" has "$(cat "$TD_LOG")" "$TD1|$R"
+check "  └ 레인은 지워짐" [ ! -e "$TD1" ]
+TD2=$(start td-two); echo y >"$TD2/td2.txt"; commit "$TD2" "td2"
+rc=0; out=$(cd "$TD2" && TEARDOWN_FAIL=1 "$WT" finish 2>&1) || rc=$?
+check "정리 스크립트가 실패해도 finish 성공·레인 삭제" bash -c "[ $rc = 0 ] && [ ! -e '$TD2' ]"
+check "  └ 경고" has "$out" "wt-teardown.sh 실패"
+TD3=$(start td-old --base td-old)   # 워크트리에는 스크립트가 없다 → 메인 폴더 것을 쓴다
+find "$(git -C "$TD3" rev-parse --absolute-git-dir)" "$TD3" -exec touch -h -t 202001010000 {} + 2>/dev/null
+out=$("$WT" gc --apply 2>&1)
+check "gc --apply도 지우기 전에 실행(스크립트 없는 레인은 메인 폴더 것)" bash -c "[ ! -e '$TD3' ] && grep -F '$TD3|$R' '$TD_LOG' >/dev/null"
+git -C "$R" branch -q -D td-old 2>/dev/null || true   # 레인이 지워지면 기준이 아니게 돼 gc가 이미 지웠을 수 있다
+
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
 bad=[f"{p}:{i}" for p in sys.argv[1:] for i,l in enumerate(open(p,encoding="utf-8"),1) if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[\uac00-\ud7a3]",l)]
