@@ -31,6 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 훅 | `~/.claude/hooks/wt-session-status` | 세션 시작 때 반영된 워크트리 자동 정리 + 남은 워크트리 알림 |
 | 저장소 파일(선택) | `.claude/wt-setup.sh` | 새 워크트리 준비(의존성 설치 등) |
 | 저장소 파일(선택) | `.claude/wt-verify.sh` | finish 때 rebase 뒤 검증 |
+| 저장소 파일(선택) | `.claude/wt-teardown.sh` | 워크트리를 지우기 직전 정리(setup이 만든 바깥 자원) |
 | 저장소 파일(선택) | `.worktreeinclude` | 새 워크트리로 복사할 gitignore 파일(예 `.env`) |
 | 저장소 파일(선택) | `.gitattributes`의 `merge=union` | 끝에 줄만 붙이는 공용 파일(로그 등)의 rebase 충돌 방지 |
 
@@ -76,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
    - 레인 브랜치 push: `git ls-remote`로 원격 sha를 읽는다. 없으면 빈 기대값(`--force-with-lease=<ref>:`, 없을 때만 만들기)으로 올린다. 있으면 이 레인이 마지막으로 올린 sha(`branch.<브랜치>.wtPushed`)이거나 HEAD의 조상일 때만 그 sha를 기대값으로 덮어쓴다(rebase 뒤 재푸시). 그 밖이면 다른 기계의 같은 이름 레인으로 보고 덮어쓰지 않고 멈춘다 — 새 이름으로 `wt start` 해 커밋을 옮긴 뒤 finish한다. 받아 둔 추적 ref(`origin/<브랜치>`)는 남의 것일 수 있어 기대값으로 쓰지 않는다. `wt start`를 거치지 않은 브랜치(하네스의 `worktree-agent-*` 등)도 같다. 머지 뒤 원격 브랜치 삭제도 HEAD를 기대값으로 한다.
    - 차례가 `--wait`(기본 3600초) 안에 오지 않으면 종료 코드 3으로 끝난다(워크트리는 남는다). 어떻게 끝나든(실패·Ctrl-C·시간 초과) 번호표를 지운다.
    원격이 없거나 GitHub가 아니면: 로컬에서 squash 커밋 → (원격 있으면) push → 기본 브랜치 fast-forward.
-8. 하네스가 건 `claude agent …` 잠금만 풀고 워크트리·로컬 브랜치 삭제.
+8. 하네스가 건 `claude agent …` 잠금만 풀고 `.claude/wt-teardown.sh`(있으면) 실행 → 워크트리·로컬 브랜치 삭제.
 9. 메인 폴더가 그 기준 브랜치에 있으면 `origin/<base>`로 fast-forward. 머지는 이미 끝났으므로 이 단계의 받기가 실패하면 한 번 다시 시도하고, 그래도 안 되면 경고만 낸다(실패로 끝내지 않는다).
 
 ## 5-1. `wt train` — 여러 레인을 한 번에
@@ -207,7 +208,14 @@ npm run lint
 npm test
 ```
 
-두 파일 모두 `chmod +x` 후 커밋한다. 없으면 그 단계는 건너뛴다. 저장소에 `.gitattributes`가 있으면 `*.sh text eol=lf`를 두어 줄바꿈 문제를 막는다.
+### `.claude/wt-teardown.sh` — 워크트리를 지우기 직전에 그 안에서 실행 (예시: `examples/wt-teardown.sh`)
+
+- `wt finish`·`wt train`(레인과 통합 워크트리)·`wt gc --apply`가 워크트리를 지우기 바로 전에 부른다. 현재 폴더 = 지울 워크트리, 환경 변수 `WT_MAIN` = 메인 폴더(`wt-setup.sh`와 같다). 표준 입력은 닫혀 있다.
+- 지울 워크트리에 스크립트가 없으면(스크립트를 커밋하기 전에 만든 레인) 메인 폴더의 것을 쓴다.
+- 실패해도 정리는 막지 않고 경고만 낸다. 쓰임: `wt-setup.sh`가 워크트리 밖에 만든 것(경로별 색인·캐시, 띄운 서비스) 치우기.
+- 하네스 `isolation: "worktree"`가 직접 지우는 워크트리, 손으로 지운 워크트리, 강제 종료로 끝난 train의 통합 워크트리에는 돌지 않는다. 남은 자원은 스크립트 쪽에서 "경로가 없는 것"을 지우는 식으로 따로 정리한다.
+
+세 파일 모두 `chmod +x` 후 커밋한다. 없으면 그 단계는 건너뛴다. 저장소에 `.gitattributes`가 있으면 `*.sh text eol=lf`를 두어 줄바꿈 문제를 막는다.
 
 ## 9. 작업 흐름
 

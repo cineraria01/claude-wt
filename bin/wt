@@ -32,6 +32,7 @@
 #   .worktreeinclude      새 워크트리로 복사할 gitignore된 파일 패턴(.env 등)
 #   .claude/wt-setup.sh   새 워크트리 준비(의존성 설치 등). WT_MAIN=메인 폴더
 #   .claude/wt-verify.sh  finish에서 rebase 뒤 실행하는 검증. 실패하면 머지 중단
+#   .claude/wt-teardown.sh finish·train·gc --apply가 워크트리를 지우기 직전에 그 안에서 실행. WT_MAIN=메인 폴더. 실패해도 정리는 계속
 set -euo pipefail
 
 die() { printf 'wt: %s\n' "$*" >&2; exit 1; }
@@ -627,6 +628,19 @@ prepare_worktree() {
   fi
 }
 
+# 워크트리를 지우기 직전: .claude/wt-teardown.sh(그 워크트리 것, 없으면 메인 폴더 것 — 스크립트가 생기기 전에 만든 레인용).
+# setup이 만든 바깥 자원(색인·캐시 등)을 치우는 자리다. 실패해도 워크트리 정리는 막지 않고 경고만 한다.
+teardown_worktree() {
+  local dir=$1 root s
+  root=$(git -C "$dir" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+  for s in "$dir/.claude/wt-teardown.sh" "$root/.claude/wt-teardown.sh"; do
+    [ -x "$s" ] || continue
+    say "정리 스크립트 실행: .claude/wt-teardown.sh ($dir)"
+    (cd "$dir" && WT_MAIN="$root" "$s" 9>&- </dev/null) || say "경고: .claude/wt-teardown.sh 실패 — 워크트리 정리는 계속합니다: $dir"
+    return 0
+  done
+}
+
 cmd_start() {
   local slug="" base=""
   while [ $# -gt 0 ]; do
@@ -759,6 +773,7 @@ remove_lane() {
   case "$(lock_reason "$dir")" in
     "claude agent"*) git worktree unlock "$dir" ;;
   esac
+  teardown_worktree "$dir"
   git worktree remove --force "$dir"
   git branch -D "$branch" >/dev/null
   rmdir "$(dirname "$dir")" 2>/dev/null || true
@@ -1016,7 +1031,7 @@ cmd_train() {
     say "머지 완료 → $base:$names"
   fi
 
-  git worktree remove --force "$WT_TMP_WT"; WT_TMP_WT=""
+  teardown_worktree "$WT_TMP_WT"; git worktree remove --force "$WT_TMP_WT"; WT_TMP_WT=""
   has_origin && { git fetch --quiet origin "$base" || say "경고: origin/$base 를 다시 받지 못해 원격 레인 브랜치 정리를 건너뛸 수 있습니다"; }
   local changed=""
   for i in $stacked $already; do
@@ -1103,7 +1118,7 @@ cmd_gc() {
       "$(dirname "$root")/$(basename "$root").wt/.train-"*)
         ps -p "${w##*.train-}" >/dev/null 2>&1 && continue   # kill -0은 권한 오류도 실패로 낸다
         n=$((n + 1)); printf '  정리 대상(끝난 train의 통합 워크트리) %s\n' "$w"
-        [ $apply = 1 ] && git worktree remove --force "$w"
+        [ $apply = 1 ] && { teardown_worktree "$w"; git worktree remove --force "$w"; }
         continue ;;
     esac
     [ -n "$b" ] || continue
@@ -1119,7 +1134,7 @@ cmd_gc() {
     fi
     content_in_base "$(base_ref "$(lane_base "$b")")" "$b" || { printf '  유지(미반영 커밋) %s  %s\n' "$w" "$b"; continue; }
     n=$((n + 1)); printf '  정리 대상 워크트리 %s  %s\n' "$w" "$b"
-    if [ $apply = 1 ]; then git worktree remove --force "$w"; git branch -D "$b" >/dev/null; fi
+    if [ $apply = 1 ]; then teardown_worktree "$w"; git worktree remove --force "$w"; git branch -D "$b" >/dev/null; fi
   done < <(git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w"\t"substr($0,19)} /^detached/{print w"\t"}')
   while read -r b; do
     [ "$b" = "$base" ] && continue
