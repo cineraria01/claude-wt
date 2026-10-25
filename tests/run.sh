@@ -449,9 +449,10 @@ wq leave "$(cat "$T/q-hf.out")"
 check "기다리다 끝난 enter는 번호표를 지움" qempty
 
 scene "⑫-4 낡은 번호표·시간 초과"
-# 다른 기계 번호표를 직접 만든다: host pid kind <마지막 갱신 몇 초 전> [<만든 지 몇 초 전, 없으면 갱신 없음>] → 번호 출력
+# 다른 기계 번호표를 직접 만든다: host pid kind <마지막 갱신 몇 초 전> [<만든 지 몇 초 전, 없으면 갱신 없음>] [<제목 끝, 기본 "note=">]
+# → 번호 출력
 qat() { local at=$(($(date +%s) - $4)) s id; id="$(($(date +%s) - ${5:-$4}))000-$1-$2"
-  s=$(cd "$GR" && GIT_COMMITTER_DATE="@$at +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=$1 pid=$2 at=old kind=$3 priority=normal lane=- note=")
+  s=$(cd "$GR" && GIT_COMMITTER_DATE="@$at +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=$1 pid=$2 at=old kind=$3 priority=normal lane=- ${6:-note=}")
   git -C "$GR" push -q origin "$s:refs/wt-queue/main/$id"; echo "$id"; }
 qhead() { local s; s=$(cd "$GR" && GIT_COMMITTER_DATE="@$(($(date +%s) - 2400)) +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue-head ticket=$1 at=old")
   git -C "$GR" push -q origin "$s:refs/wt-queue/main/_head"; }
@@ -499,6 +500,26 @@ O4=$(qat elsewhere 1 merge 200 300)
 rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
 check "  └ 한 번 갱신된 다른 host 번호표는 같은 나이라도 넘겨받지 않음(3)" [ "$rc" = 3 ]
 git -C "$GR" push -q origin ":refs/wt-queue/main/$O4"
+# 갱신 표식(beat=1): 받자마자 올린 갱신이 있으면 그 뒤 끊겨도(첫 주기 전 와이파이·잠자기) 30분 규칙
+O4=$(qat elsewhere 1 merge 200 200 "beat=1 note=")
+rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
+check "  └ 갱신 표식이 있으면 커밋 시각이 생성 시각과 같아도 넘겨받지 않음(3)" [ "$rc" = 3 ]
+git -C "$GR" push -q origin ":refs/wt-queue/main/$O4"
+O4=$(qat elsewhere 1 merge 200 200 "note=메모 beat=1")
+rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 10 2>&1) || rc=$?
+check "  └ 메모 안의 beat=1은 표식이 아님(넘겨받음)" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '낡은 번호표를 지웁니다(main/$O4)' >/dev/null" _ "$out"
+wq leave "$(printf '%s\n' "$out" | tail -n 1)" || git -C "$GR" push -q origin ":refs/wt-queue/main/$O4" ":refs/wt-queue/main/_head"
+sleep 300 & SP3=$!
+QR=$(WT_HOST=hb WT_QUEUE_BEAT=20 wq enter merge --pid "$SP3" 2>/dev/null) || true
+check "번호표를 받자마자(첫 주기 20초 전) 표식 달린 갱신이 올라감" bash -c "for _ in \$(seq 1 20); do git --git-dir='$G' log -1 --format=%s '$QR' 2>/dev/null | grep -F ' beat=1 note=' >/dev/null && exit 0; sleep 0.5; done; exit 1"
+check "  └ 표식이 있어도 목록은 그대로(메모 칸에 표식 없음)" bash -c "printf '%s\n' \"\$1\" | grep -E '^  1\. normal  hb  merge  \(0분째\) \[차례\]  $QR  $' >/dev/null" _ "$(wq 2>&1)"
+wq leave "$QR"; kill "$SP3"; wait "$SP3" 2>/dev/null || true
+# 0으로 시작하는 번호(bash 3.2가 8진으로 읽다 셸을 끝냄)
+s=$(cd "$GR" && GIT_COMMITTER_DATE="@$(($(date +%s) - 200)) +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=zero pid=1 at=old kind=merge priority=normal lane=- note=")
+git -C "$GR" push -q origin "$s:refs/wt-queue/main/0999-zero-1"
+rc=0; out=$(wq 2>&1) || rc=$?
+check "0으로 시작하는 번호도 대기열을 읽음(10진)" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F 'refs/wt-queue/main/0999-zero-1' >/dev/null" _ "$out"
+git -C "$GR" push -q origin ":refs/wt-queue/main/0999-zero-1"
 check "대기열 비움" qempty
 check "origin 없으면 queue 1" bash -c "cd '$T/noorigin' && ! '$WT' queue 2>/dev/null"
 check "잘못된 kind 거절" bash -c "! (cd '$GR' && '$WT' queue enter deploy 2>/dev/null)"
@@ -797,10 +818,28 @@ check "  └ 검증 기록이 그 워크트리 git 폴더에" [ -s "$R/.git/work
 out=$(cd "$E3" && GIT_DIR=../../$(basename "$R")/.git "$WT" list 2>&1) || true
 check "메인 .git을 가리키는 상대 GIT_DIR로 list(다른 워크트리 위치에서)" has "$out" "$E3  wt/env-gd"
 rc=0; out=$(cd "$T" && GIT_DIR="$T/origin.git" "$WT" list 2>&1) || rc=$?
-check "bare 저장소 GIT_DIR로 list" bash -c "[ $rc = 0 ]"
+check "bare 저장소 GIT_DIR로 list" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '기준: main' >/dev/null" _ "$out"
 rc=0; out=$(cd "$T" && GIT_DIR="$T/nowhere.git" "$WT" list 2>&1) || rc=$?
 check "저장소를 못 찾으면 오류" [ "$rc" != 0 ]
 git -C "$R" worktree remove --force "$E3"; git -C "$R" branch -q -D wt/env-gd
+# 시작 때 옮겨 간 폴더: wt 머리(맨 위 ~ 정리 트랩 앞)만 돌려 pwd를 본다. wtcwd <부를 폴더> <환경…>
+wtcwd() { local d=$1; shift; (cd "$d" && env "$@" bash -c 'eval "$(sed -n "2,/^# 끝날 때(die/p" "$0")"; pwd -P' "$WT"); }
+NB="$T/nobare"; git init -q -b main "$NB"; git -C "$NB" commit -q --allow-empty -m i; git -C "$NB" config --unset core.bare
+check "core.bare 없는 일반 저장소 .git은 부모로 옮김(.git 안 아님)" [ "$(wtcwd "$T" GIT_DIR="$NB/.git")" = "$NB" ]
+check "bare 저장소는 그 폴더로" [ "$(wtcwd "$T" GIT_DIR="$T/origin.git")" = "$T/origin.git" ]
+rc=0; out=$(cd "$NB" && GIT_DIR="$R/.git" "$WT" list 2>&1) || rc=$?
+check "작업 폴더가 GIT_DIR과 다른 저장소 안이면 옮기지 않고 멈춤" bash -c "[ $rc != 0 ] && printf '%s' \"\$1\" | grep -F '다른 저장소 안' >/dev/null" _ "$out"
+git -C "$NB" worktree add -q -b nested "$NB/nested"
+rc=0; out=$(cd "$NB/nested" && GIT_DIR="$NB/.git" "$WT" list 2>&1) || rc=$?
+check "그 워크트리 안의 중첩 워크트리에서 부르면 맨 위로 옮김" bash -c "[ $rc = 0 ] && [ '$(wtcwd "$NB/nested" GIT_DIR="$NB/.git")' = '$NB' ]"
+git -C "$NB" worktree add -q --relative-paths -b relwt "$T/nobare-rel" 2>/dev/null \
+  || { git -C "$NB" worktree add -q -b relwt "$T/nobare-rel"; printf '../../../../nobare-rel/.git\n' >"$NB/.git/worktrees/nobare-rel/gitdir"; }   # --relative-paths 없는 git: 흉내
+check "  (상대 gitdir 파일)" bash -c "! grep -q '^/' '$NB/.git/worktrees/nobare-rel/gitdir'"
+out=$(cd "$T" && GIT_DIR="$NB/.git/worktrees/nobare-rel" "$WT" claim 2>&1) || true
+check "상대 경로 gitdir 파일의 워크트리 git 폴더 GIT_DIR로 claim이 그 워크트리를 맡음" has "$out" "이 세션이 $T/nobare-rel 를 맡습니다"
+SUP="$T/super"; git init -q -b main "$T/subsrc"; git -C "$T/subsrc" commit -q --allow-empty -m s
+git init -q -b main "$SUP"; (cd "$SUP" && git -c protocol.file.allow=always submodule add -q "$T/subsrc" sm >/dev/null 2>&1 && git commit -qm sm)
+check "하위 모듈 git 폴더(core.worktree) GIT_DIR이면 그 작업 폴더로" [ "$(wtcwd "$T" GIT_DIR="$SUP/.git/modules/sm")" = "$SUP/sm" ]
 
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
