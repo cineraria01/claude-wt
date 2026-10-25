@@ -43,6 +43,37 @@ say() { printf '▸ %s\n' "$*" >&2; }
 git() ( exec 9>&-; exec git "$@" )
 gh() ( exec 9>&-; exec gh "$@" )
 
+# git 위치 환경(git 훅 안의 GIT_DIR=.git 등)이 있으면 그것으로 저장소·워크트리를 절대 경로로 구해 그리로 옮기고 지운다.
+# 남겨 두면 cd(상대 경로가 깨짐)와 git -C <다른 워크트리>도 그 GIT_DIR를 봐 엉뚱한 곳을 다룬다. 인증 변수(GIT_SSH_COMMAND 등)는 그대로.
+# GIT_WORK_TREE가 있으면 그것, 없으면 git 폴더에서: 워크트리 git 폴더(<공용>/worktrees/<이름>)는 gitdir 파일, bare는 그 폴더,
+# core.worktree가 있으면 그것, 나머지는 부모. 이미 그 워크트리 안이면 자리를 지킨다(그 안의 중첩 워크트리면 맨 위로 옮긴다).
+# 현재 폴더가 다른 저장소의 작업 폴더 안이면 옮기지 않고 멈춘다. 저장소를 못 찾으면 그대로 두어 뒤 명령이 지금처럼 오류를 낸다.
+if [ -n "${GIT_DIR-}${GIT_WORK_TREE-}${GIT_COMMON_DIR-}${GIT_INDEX_FILE-}${GIT_OBJECT_DIRECTORY-}${GIT_ALTERNATE_OBJECT_DIRECTORIES-}" ] \
+  && wt_gd=$(git rev-parse --absolute-git-dir 2>/dev/null); then
+  wt_top=""; [ -z "${GIT_WORK_TREE-}" ] || wt_top=$(git rev-parse --show-toplevel 2>/dev/null) || wt_top=""
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+  if [ -n "$wt_top" ]; then :
+  elif [ -f "$wt_gd/gitdir" ]; then
+    wt_top=$(cat "$wt_gd/gitdir"); case $wt_top in /*) ;; *) wt_top=$wt_gd/$wt_top ;; esac; wt_top=$(dirname "$wt_top")
+  elif [ "$(git --git-dir="$wt_gd" config --bool core.bare 2>/dev/null)" = true ]; then wt_top=$wt_gd   # git -C <.git>은 core.bare 없으면 bare로 답한다
+  elif wt_top=$(git -C "$wt_gd" config core.worktree 2>/dev/null); then   # 하위 모듈(.git/modules/<이름>) 등
+    case $wt_top in /*) ;; *) wt_top=$wt_gd/$wt_top ;; esac
+  else wt_top=$(dirname "$wt_gd")
+  fi
+  wt_top=$(cd "$wt_top" && pwd -P) || die "git 위치 환경(GIT_DIR 등)의 저장소 폴더로 옮기지 못했습니다: $wt_top"
+  wt_gd=$(cd "$wt_gd" && pwd -P)
+  wt_here() { cd "$(git rev-parse --absolute-git-dir 2>/dev/null)" 2>/dev/null && pwd -P; }
+  if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ] \
+    && [ "$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -P)" \
+      != "$(cd "$(git --git-dir="$wt_gd" rev-parse --path-format=absolute --git-common-dir)" && pwd -P)" ]; then   # git 2.31+
+    die "작업 폴더가 git 위치 환경(GIT_DIR 등)과 다른 저장소 안입니다: $(pwd -P) (GIT_DIR 쪽 git 폴더 $wt_gd)"
+  fi
+  case $(pwd -P)/ in "$wt_top"/*) ;; *) cd "$wt_top" ;; esac
+  [ "$(wt_here)" = "$wt_gd" ] || cd "$wt_top"   # 그 워크트리 안의 중첩 워크트리
+  [ "$(wt_here)" = "$wt_gd" ] || die "git 위치 환경(GIT_DIR 등)의 워크트리 $wt_top 에서 git이 다른 git 폴더($(wt_here))를 찾습니다(기대 $wt_gd)"
+  unset -f wt_here; unset wt_gd wt_top
+fi
+
 # 끝날 때(die·Ctrl-C 포함) 쥐고 있는 머지 번호표(q_enter)를 지우고 train의 임시 통합 워크트리를 치운다.
 # 머지 잠금은 프로세스가 끝나면 OS가 푼다(take_lock). 신호로 끝날 때도 EXIT 트랩이 돌도록 exit으로 바꾼다.
 WT_TMP_WT="" WT_ROOT="" WT_Q_REF="" WT_Q_HEAD="" WT_Q_HB="" WT_Q_USED=""
@@ -403,7 +434,8 @@ cmd_claims() {
 # (제목 "wt-queue-head ticket=<번호>")를 빈 lease로 만들어 차례를 쥔다 — 동시에 맨 앞이라 판단해도 하나만 쥐고, 쥔 뒤에는 등급 높은
 # 번호표가 와도 밀리지 않는다. 번호표의 pid(finish·train은 wt 자신, wt queue enter는 --pid)가 살아 있는 동안 백그라운드 갱신(q_beat)이
 # WT_QUEUE_BEAT(60)초마다 번호표를 새 시각으로 다시 올리고, 그 pid가 끝나면 번호표(와 그 번호표의 _head)를 지운다.
-# 낡은 번호표: 마지막 갱신이 30분보다 오래됨, 또는 같은 host의 끝난 pid이면서 마지막 갱신이 갱신 주기의 3배보다 오래됨
+# 낡은 번호표: 마지막 갱신이 30분보다 오래됨, 갱신 표식이 없고 주기 3배 + 시계 여유가 지남(q_stale), 또는 같은 host의 끝난
+# pid이면서 마지막 갱신이 갱신 주기의 3배보다 오래됨
 # (host 이름이 같은 다른 기계의 살아 있는 번호표를 지우지 않게) → 경고 뒤 lease 삭제. _head가 가리키는 번호표가 없으면 _head도 지운다.
 # 기계 시계가 맞아야 한다(번호·나이가 시각이다).
 q_base() { echo "${1//\//_}"; }
@@ -411,10 +443,20 @@ q_field() { local re="(^| )$1=([^ ]*)"; [[ $2 =~ $re ]] && echo "${BASH_REMATCH[
 q_rank() { case $1 in critical) echo 0 ;; release) echo 1 ;; *) echo 2 ;; esac; }
 q_ms() { python3 -I -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || echo "$(date +%s)000"; }
 q_commit() { GIT_AUTHOR_NAME=wt GIT_AUTHOR_EMAIL=wt GIT_COMMITTER_NAME=wt GIT_COMMITTER_EMAIL=wt git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "$1"; }
-q_stale() { # <마지막 갱신 시각> <제목>
-  local age h p; age=$(($(date +%s) - $1))
+# q_born <번호>: 번호의 생성 시각(초). 0으로 시작해도 10진(bash 3.2는 8진으로 읽다 셸을 끝낸다). 숫자가 아니면 빈 값.
+q_born() { case ${1%%-*} in ''|*[!0-9]*) ;; *) echo $((10#${1%%-*} / 1000)) ;; esac; }
+# 갱신 표식: 갱신(q_beat)은 제목 note= 앞에 beat=1을 넣어 올리고, 번호표 push에 성공하면 첫 sleep 전에 바로 한 번 올린다.
+# 표식 없는 번호표 = 갱신이 한 번도 안 올라감 — 결과를 모른 채 늦게 반영된 push(q_enter가 1, 갱신이 안 뜸)의 고아이거나
+# 번호표를 만든 직후 몇 초 안에 끊긴 기계. 이것은 만든 지 갱신 주기 3배 + 시계 여유 WT_QUEUE_SKEW(120)초가 지나면 host와
+# 관계없이 낡음(다른 기계를 30분 막지 않게). 옛 판 wt는 표식 없이 갱신하므로 표식이 없어도 커밋 시각이 생성 시각에서 갱신 주기
+# 절반 넘게 지났으면 갱신된 것으로 본다(둘 다 만든 기계의 시계; 주기는 모든 기계가 같아야 한다). 30분은 갱신된 번호표에만.
+q_beaten() { [ "$(q_field beat "${1%% note=*}")" = 1 ]; }   # note= 뒤 글은 보지 않는다(메모에 beat=1을 써도 속지 않게)
+q_stale() { # <마지막 갱신 시각> <제목> <번호>
+  local age h p b=${WT_QUEUE_BEAT:-60} c; age=$(($(date +%s) - $1)); c=$(q_born "$3")
   [ "$age" -gt 1800 ] && return 0
-  [ "$age" -gt $((3 * ${WT_QUEUE_BEAT:-60})) ] || return 1
+  [ "$age" -gt $((3 * b)) ] || return 1
+  if [ -n "$c" ] && ! q_beaten "$2" && [ $(($1 - c)) -lt $((b / 2 > 0 ? b / 2 : 1)) ] \
+    && [ "$age" -gt $((3 * b + ${WT_QUEUE_SKEW:-120})) ]; then return 0; fi
   h=$(q_field host "$2"); p=$(q_field pid "$2")
   [ -n "$p" ] && [ "$h" = "$(claim_host)" ] && ! ps -p "$p" >/dev/null 2>&1   # kill -0은 권한 오류도 실패로 낸다
 }
@@ -435,7 +477,7 @@ q_scan() {
   done <<<"$all"
   while IFS=$'\t' read -r id sha ct subj; do
     { [ -n "$id" ] && [ "$id" != _head ]; } || continue
-    if [ "$id" != "$me" ] && q_stale "$ct" "$subj"; then
+    if [ "$id" != "$me" ] && q_stale "$ct" "$subj" "$id"; then
       say "경고: 낡은 번호표를 지웁니다($qb/$id): ${subj#wt-queue }"
       git push --quiet --force-with-lease="refs/wt-queue/$qb/$id:$sha" origin ":refs/wt-queue/$qb/$id" >/dev/null 2>&1 || true
       continue
@@ -466,8 +508,8 @@ q_enter() {
   WT_Q_HB=$!
 }
 # q_bg <git 공용 폴더> <함수> <인자…>: 백그라운드에서 그 폴더로 옮겨 함수를 돈다. 부르는 줄에 리다이렉션을 붙이지 않는다(위 on_exit).
-# git 공용 폴더에서: 부른 쪽 작업 폴더(워크트리)가 나중에 지워져도 git을 쓸 수 있게. 그래서 상대 경로일 수 있는 git 위치
-# 환경(git 훅 안의 GIT_DIR=.git 등)은 지운다 — 옮긴 폴더에서 git이 스스로 찾는다.
+# git 공용 폴더에서: 부른 쪽 작업 폴더(워크트리)가 나중에 지워져도 git을 쓸 수 있게. git 위치 환경은 시작 때 이미 지웠다
+# (맨 위) — 아래 unset은 그것에 기대지 않는 이중 안전장치다. 옮긴 폴더에서 git이 스스로 찾는다.
 # 출력은 /dev/null(명령 치환으로 부른 쪽이 남은 sleep 때문에 기다리지 않게). 0~2 밖의 열린 fd도 모두 닫는다: 머지 잠금 fd 9,
 # 부른 쪽이 연 fd(exec 200>lock 등), INT·TERM 트랩이 셸 함수 git·gh의 리다이렉션 도중에 돌 때 bash 3.2가 10 이상에 보관해 둔 사본.
 q_bg() {
@@ -479,16 +521,18 @@ q_bg() {
     cd "$d" && "$@" ) >/dev/null 2>&1 &
 }
 # q_beat <ref> <sha> <제목> <pid> <상한 초>: pid가 살아 있는 동안 번호표를 갱신한다. pid가 끝나면 번호표를 지우고 끝난다.
+# 번호표를 받자마자 표식(beat=1) 달린 갱신을 한 번 올리고 그 뒤 주기마다(위 q_stale). 실패하면 다음 주기에 다시.
 # 상한(기다림 + 차례를 쥘 최대 시간)이 지나면 갱신을 멈춘다 — 오래 사는 pid를 넘겨도 30분 뒤 낡음으로 풀린다(wt queue에 [갱신 멈춤]).
 # push가 실패하면 origin을 다시 본다: 아직 내 sha(또는 조회 실패)면 다음 주기에 다시, 없어졌거나 다른 sha(남이 낡은 것으로
 # 지움·wt queue leave)면 끝난다 — lease가 어긋나 되살리지 않는다. 다시 보기도 실패하면 올라갔는지 모르는 sha를 후보(alts)로 기억해
 # 다음에 origin이 그중 하나면 내 것으로 본다(--pid가 끝나 지울 때도 후보까지 내 것).
 q_beat() {
-  local ref=$1 sha=$2 new cur end alts=""; end=$(($(date +%s) + $5))
-  while sleep "${WT_QUEUE_BEAT:-60}"; do
+  local ref=$1 sha=$2 subj=${3/ note=/ beat=1 note=} new cur end alts="" first=1; end=$(($(date +%s) + $5))
+  while [ -n "$first" ] || sleep "${WT_QUEUE_BEAT:-60}"; do
+    first=""
     if ! ps -p "$4" >/dev/null 2>&1; then q_reap "$ref" "" "$sha$alts" now; exit 0; fi
     [ "$(date +%s)" -lt "$end" ] || exit 0
-    new=$(q_commit "$3") || continue
+    new=$(q_commit "$subj") || continue
     if git push --quiet --force-with-lease="$ref:$sha" origin "$new:$ref" >/dev/null 2>&1; then sha=$new alts=""; continue; fi
     cur=$(git ls-remote origin "$ref") || { alts+=" $new"; continue; }
     cur=${cur%%[[:space:]]*}
@@ -525,7 +569,7 @@ q_wait() {
     if [ "$now" -ge "$next" ]; then
       n=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
       IFS=$'\t' read -r fid _ fs <<<"${rows%%$'\n'*}"
-      if [ "$fid" = "$hid" ]; then since=$hct; else since=$((${fid%%-*} / 1000)); fi
+      if [ "$fid" = "$hid" ]; then since=$hct; else since=$(q_born "$fid"); since=${since:-$now}; fi
       lane=$(q_field lane "$fs"); [ "$lane" != - ] || lane=$(q_field kind "$fs")
       say "머지 순번 $k/$n · 앞: $(q_field host "$fs") $lane($(((now - since) / 60))분째)"
       next=$((now + 60))
@@ -659,7 +703,7 @@ cmd_queue() {
     esac
     return
   fi
-  local qb t hid hct rows id ct subj i=0 now lane2 mark; qb=$(q_base "$base"); WT_Q_USED=1; now=$(date +%s)
+  local qb t hid hct rows id ct subj i=0 now lane2 mark born; qb=$(q_base "$base"); WT_Q_USED=1; now=$(date +%s)
   t=$(q_scan "$qb" "") || die "origin에서 대기열을 읽지 못했습니다"
   read -r hid _ hct <<<"${t%%$'\n'*}"; rows=$(printf '%s\n' "$t" | sed 1d)
   echo "머지 대기열 $base:"
@@ -671,8 +715,9 @@ cmd_queue() {
     fi
     [ $((now - ct)) -le $((3 * ${WT_QUEUE_BEAT:-60})) ] || mark+=" [갱신 멈춤 $(((now - ct) / 60))분]"
     lane2=$(q_field lane "$subj"); [ "$lane2" != - ] || lane2=""
+    born=$(q_born "$id"); born=${born:-$now}
     printf '  %d. %s  %s  %s %s (%s분째)%s  %s  %s\n' $i "$(q_field priority "$subj")" "$(q_field host "$subj")" "$(q_field kind "$subj")" \
-      "$lane2" $(((now - ${id%%-*} / 1000) / 60)) "$mark" "refs/wt-queue/$qb/$id" "${subj#*note=}"
+      "$lane2" $(((now - born) / 60)) "$mark" "refs/wt-queue/$qb/$id" "${subj#*note=}"
   done <<<"$rows"
 }
 
