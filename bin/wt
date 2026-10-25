@@ -46,6 +46,7 @@ gh() ( exec 9>&-; exec gh "$@" )
 # 끝날 때(die·Ctrl-C 포함) 쥐고 있는 머지 번호표(q_enter)를 지우고 train의 임시 통합 워크트리를 치운다.
 # 머지 잠금은 프로세스가 끝나면 OS가 푼다(take_lock). 신호로 끝날 때도 EXIT 트랩이 돌도록 exit으로 바꾼다.
 WT_TMP_WT="" WT_ROOT="" WT_Q_REF="" WT_Q_HEAD="" WT_Q_HB="" WT_Q_USED=""
+WT_Q_SELF=$$   # 이 프로세스의 pid. 백그라운드 서브셸에서 $$는 부모 pid라 q_bg가 실제 pid로 바꾼다(bash 3.2엔 BASHPID 없음)
 on_exit() {
   # 리다이렉션을 붙이지 않는다: bash 3.2는 원래 fd를 10 이상에 복사해 두는데 그 사이 띄운 정리 프로세스(q_reap_bg)가 사본을 물려받아
   # $(wt queue enter …)로 부른 쪽의 파이프를 최대 30분 붙든다. 경고는 보이고 git 잡음은 q_drop이 버린다.
@@ -424,6 +425,10 @@ q_prio_ok() { case $1 in critical|release|normal) ;; *) die "--priority 는 crit
 q_scan() {
   local qb=$1 me=$2 ns="refs/wt-queue-seen/$$" all id sha ct subj thr hid="" hsha="" hct="" rows=""
   git fetch --quiet --no-tags --prune origin "+refs/wt-queue/$qb/*:$ns/*" 2>/dev/null || return 1
+  # q_drop이 fetch와 지우기 사이에 죽어 남긴 임시 ref(이 기계 것이라 이름의 pid로 판정)를 치운다
+  while read -r id; do
+    sha=${id#refs/wt-queue-drop/}; ps -p "${sha%%-*}" >/dev/null 2>&1 || git update-ref -d "$id" 2>/dev/null || true
+  done < <(git for-each-ref --format='%(refname)' refs/wt-queue-drop/ 2>/dev/null)
   all=$(git for-each-ref --format='%(refname:lstrip=3)%09%(objectname)%09%(committerdate:unix)%09%(contents:subject)' "$ns/")
   while IFS=$'\t' read -r id sha ct subj; do
     [ "$id" = _head ] && { hid=$(q_field ticket "$subj") hsha=$sha hct=$ct; }
@@ -457,10 +462,20 @@ q_enter() {
   git push --quiet --force-with-lease="refs/wt-queue/$qb/$id:" origin "$sha:refs/wt-queue/$qb/$id" >/dev/null 2>&1 \
     || { q_reap_bg "refs/wt-queue/$qb/$id" "" "$sha"; return 1; }
   WT_Q_REF="refs/wt-queue/$qb/$id"
-  # 출력을 /dev/null로: 명령 치환으로 부른 쪽이 남은 sleep 때문에 기다리지 않게. 머지 잠금 fd도 넘기지 않는다.
-  # git 공용 폴더에서: 부른 쪽 작업 폴더(워크트리)가 나중에 지워져도 갱신·정리가 git을 쓸 수 있게.
-  (cd "$d" && q_beat "$WT_Q_REF" "$sha" "$subj" "$4" "$7") >/dev/null 2>&1 9>&- &
+  q_bg "$d" q_beat "$WT_Q_REF" "$sha" "$subj" "$4" "$7"
   WT_Q_HB=$!
+}
+# q_bg <git 공용 폴더> <함수> <인자…>: 백그라운드에서 그 폴더로 옮겨 함수를 돈다. 부르는 줄에 리다이렉션을 붙이지 않는다(위 on_exit).
+# git 공용 폴더에서: 부른 쪽 작업 폴더(워크트리)가 나중에 지워져도 git을 쓸 수 있게. 그래서 상대 경로일 수 있는 git 위치
+# 환경(git 훅 안의 GIT_DIR=.git 등)은 지운다 — 옮긴 폴더에서 git이 스스로 찾는다.
+# 출력은 /dev/null(명령 치환으로 부른 쪽이 남은 sleep 때문에 기다리지 않게). 0~2 밖의 열린 fd도 모두 닫는다: 머지 잠금 fd 9,
+# 부른 쪽이 연 fd(exec 200>lock 등), INT·TERM 트랩이 셸 함수 git·gh의 리다이렉션 도중에 돌 때 bash 3.2가 10 이상에 보관해 둔 사본.
+q_bg() {
+  local d=$1; shift
+  ( for f in /dev/fd/*; do f=${f##*/}; [ "$f" -gt 2 ] 2>/dev/null && { eval "exec $f>&-" || :; }; done 2>/dev/null
+    WT_Q_SELF=$(exec sh -c 'echo $PPID')   # exec: sh의 부모가 이 서브셸이 된다
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    cd "$d" && "$@" ) >/dev/null 2>&1 &
 }
 # q_beat <ref> <sha> <제목> <pid> <상한 초>: pid가 살아 있는 동안 번호표를 갱신한다. pid가 끝나면 번호표를 지우고 끝난다.
 # 상한(기다림 + 차례를 쥘 최대 시간)이 지나면 갱신을 멈춘다 — 오래 사는 pid를 넘겨도 30분 뒤 낡음으로 풀린다(wt queue에 [갱신 멈춤]).
@@ -521,10 +536,11 @@ q_wait() {
 # q_drop <번호표 ref> [<_head sha>] [<번호표 sha>]: 번호표를 지우고 차례를 놓는다. _head sha를 모르면 _head가 이 번호표를 가리킬 때만
 # 놓는다. 번호표 sha를 주면 그 sha일 때만 지운다(lease). 번호표가 origin에서 사라졌으면 0.
 q_drop() {
-  # 임시 ref는 q_scan이 읽는 refs/wt-queue-seen/ 밖에(같은 pid의 다른 wt 목록에 보이거나 그쪽 --prune에 지워지지 않게)
-  local ref=$1 h=${1%/*}/_head hs=${2-} tmp="refs/wt-queue-drop/$$-$RANDOM" out
+  # 임시 ref는 q_scan이 읽는 refs/wt-queue-seen/ 밖에(같은 pid의 다른 wt 목록에 보이거나 그쪽 --prune에 지워지지 않게).
+  # 지우기 전에 죽으면 남는다 — 이름의 pid(WT_Q_SELF, 백그라운드도 자기 pid)가 끝난 뒤 q_scan이 치운다.
+  local ref=$1 h=${1%/*}/_head hs=${2-} tmp="refs/wt-queue-drop/$WT_Q_SELF-$RANDOM" out
   if [ -z "$hs" ] && git fetch --quiet --no-tags origin "+$h:$tmp" 2>/dev/null; then
-    [ "$(q_field ticket "$(git log -1 --format=%s "$tmp" 2>/dev/null)")" = "${ref##*/}" ] && hs=$(git rev-parse "$tmp")
+    [ "$(q_field ticket "$(git log -1 --format=%s "$tmp" 2>/dev/null)")" = "${ref##*/}" ] && hs=$(git rev-parse --verify -q "$tmp")
     git update-ref -d "$tmp" 2>/dev/null
   fi
   git push --quiet ${3:+--force-with-lease="$ref:$3"} origin ":$ref" >/dev/null 2>&1 || true   # 이미 없으면 실패한다 — 아래에서 확인
@@ -535,13 +551,21 @@ q_drop() {
 # WT_QUEUE_POLL(5)초마다 다시. 지워졌거나(남이 지운 것 포함) sha 후보를 주었는데 origin이 그 밖의 sha거나 상한 WT_QUEUE_REAP(1800초 =
 # 낡음 판정)이 지나면 끝난다. sha 후보를 주면 지금 sha에 lease, 안 주면 이름으로 지운다. 지우기만 하고 다시 올리지 않는다.
 # _head는 q_drop처럼 내 번호표를 가리킬 때만 lease로 지운다. now가 없으면 한 주기 쉰 뒤 시작한다(방금 실패한 뒤라).
+# sha 후보를 주면 처음 빈 결과를 본 뒤 WT_QUEUE_LATE(30)초 동안 더 본다 — 결과를 모르던 번호표 push(빈 lease)는 서버 반영이
+# 첫 조회보다 늦을 수 있다. 조회 간격(WT_QUEUE_POLL)과 따로 둔다: 창은 서버 지연의 길이라 간격을 줄여도 줄면 안 된다.
+# (갱신 push는 lease가 내 sha라 지워진 뒤에는 반영되지 않는다.) 이름으로 지울 때는 바로 끝난다.
 q_reap() {
-  local cur end; end=$(($(date +%s) + ${WT_QUEUE_REAP:-1800}))
+  local cur end late=""; end=$(($(date +%s) + ${WT_QUEUE_REAP:-1800}))
   [ -n "${4-}" ] || sleep "${WT_QUEUE_POLL:-5}"
   while :; do
     if cur=$(git ls-remote origin "$1"); then
       cur=${cur%%[[:space:]]*}
-      [ -n "$cur" ] || return 0
+      if [ -z "$cur" ]; then
+        [ -n "${3-}" ] || return 0
+        [ -n "$late" ] || late=$(($(date +%s) + ${WT_QUEUE_LATE:-30}))
+        [ "$(date +%s)" -lt "$late" ] || return 0
+        sleep "${WT_QUEUE_POLL:-5}"; continue
+      fi
       if [ -n "${3-}" ]; then case " $3 " in *" $cur "*) ;; *) return 0 ;; esac; fi
       ! q_drop "$1" "${2-}" "${3:+$cur}" || return 0
     fi
@@ -561,11 +585,10 @@ q_leave() {
   fi
   WT_Q_REF="" WT_Q_HEAD="" WT_Q_HB=""
 }
-# q_reap_bg <q_reap 인자…>: 부른 pid와 상관없이 백그라운드에서 q_reap. 경로는 부모에서 먼저 정한다 — 워크트리가 곧 지워질 수 있어
-# git 공용 폴더에서 돈다. 출력은 /dev/null(명령 치환으로 부른 쪽이 기다리지 않게), 머지 잠금 fd도 넘기지 않는다.
+# q_reap_bg <q_reap 인자…>: 부른 pid와 상관없이 백그라운드에서 q_reap(q_bg). 경로는 부모에서 먼저 정한다 — 워크트리가 곧 지워질 수 있다.
 q_reap_bg() {
   local d; d=$(git_common_dir 2>/dev/null) && [ -n "$d" ] || return 0
-  (cd "$d" && q_reap "$@") >/dev/null 2>&1 9>&- &
+  q_bg "$d" q_reap "$@"
 }
 # finish·train: 번호표를 받아 차례를 기다린다. 시간 초과는 종료 코드 3(번호표는 on_exit가 지운다).
 queue_turn() { # <기준> <kind> <priority> <lane> <기다릴 초> [<메모>]
