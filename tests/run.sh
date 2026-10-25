@@ -449,8 +449,8 @@ wq leave "$(cat "$T/q-hf.out")"
 check "기다리다 끝난 enter는 번호표를 지움" qempty
 
 scene "⑫-4 낡은 번호표·시간 초과"
-# 다른 기계 번호표를 직접 만든다: host pid kind 몇 초 전 → 번호 출력
-qat() { local at=$(($(date +%s) - $4)) s id; id="${at}000-$1-$2"
+# 다른 기계 번호표를 직접 만든다: host pid kind <마지막 갱신 몇 초 전> [<만든 지 몇 초 전, 없으면 갱신 없음>] → 번호 출력
+qat() { local at=$(($(date +%s) - $4)) s id; id="$(($(date +%s) - ${5:-$4}))000-$1-$2"
   s=$(cd "$GR" && GIT_COMMITTER_DATE="@$at +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=$1 pid=$2 at=old kind=$3 priority=normal lane=- note=")
   git -C "$GR" push -q origin "$s:refs/wt-queue/main/$id"; echo "$id"; }
 qhead() { local s; s=$(cd "$GR" && GIT_COMMITTER_DATE="@$(($(date +%s) - 2400)) +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue-head ticket=$1 at=old")
@@ -461,11 +461,12 @@ check "40분 된 다른 기계 merge 차례는 넘겨받음" [ "$rc" = 0 ]
 check "  └ 경고" has "$out" "경고: 낡은 번호표를 지웁니다(main/$O1)"
 check "  └ 낡은 번호표 지워짐" [ -z "$(git ls-remote "$G" "refs/wt-queue/main/$O1")" ]
 wq leave "$(printf '%s\n' "$out" | tail -n 1)"
-O2=$(qat elsewhere 1 release 1200)
+O2=$(qat elsewhere 1 release 1200 1500)
 s=$(date +%s); rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 2 2>&1) || rc=$?
 check "20분 된 다른 기계 release는 낡지 않음 → 시간 초과 3" [ "$rc" = 3 ]
 check "  └ 2초 이상 기다림" [ $(($(date +%s) - s)) -ge 2 ]
 check "  └ 시간 초과 안내" has "$out" "2초 기다렸지만 차례가 오지 않았습니다"
+check "  └ 한 번이라도 갱신된 다른 host 번호표는 30분 규칙 그대로" [ -n "$(git ls-remote "$G" "refs/wt-queue/main/$O2")" ]
 check "  └ 내 번호표는 지우고 남의 것은 둠" bash -c "[ \"\$(git ls-remote '$G' 'refs/wt-queue/main/*' | cut -f2)\" = 'refs/wt-queue/main/$O2' ]"
 git -C "$GR" push -q origin ":refs/wt-queue/main/$O2"
 O2=$(qat elsewhere 1 release 2400)
@@ -484,6 +485,19 @@ wq leave "$(printf '%s\n' "$out" | tail -n 1)"
 O4=$(qat elsewhere "$DEAD" merge 0)
 rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
 check "다른 host의 pid는 끝났는지 몰라 넘겨받지 않음(3)" [ "$rc" = 3 ]
+git -C "$GR" push -q origin ":refs/wt-queue/main/$O4"
+# 한 번도 갱신되지 않은 번호표(결과를 모른 채 늦게 반영된 push): 갱신 주기 3배 + 시계 여유(120초)가 지나면 다른 host라도 낡음
+O4=$(qat elsewhere 1 merge 200); qhead "$O4"
+rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 10 2>&1) || rc=$?
+check "갱신 없는 다른 host 번호표(차례 쥠)는 주기 3배 + 여유 뒤 넘겨받음" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '낡은 번호표를 지웁니다(main/$O4)' >/dev/null" _ "$out"
+wq leave "$(printf '%s\n' "$out" | tail -n 1)"
+O4=$(qat elsewhere 1 merge 100)
+rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
+check "  └ 여유(주기 3배 + 120초) 안이면 넘겨받지 않음(3)" [ "$rc" = 3 ]
+git -C "$GR" push -q origin ":refs/wt-queue/main/$O4"
+O4=$(qat elsewhere 1 merge 200 300)
+rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
+check "  └ 한 번 갱신된 다른 host 번호표는 같은 나이라도 넘겨받지 않음(3)" [ "$rc" = 3 ]
 git -C "$GR" push -q origin ":refs/wt-queue/main/$O4"
 check "대기열 비움" qempty
 check "origin 없으면 queue 1" bash -c "cd '$T/noorigin' && ! '$WT' queue 2>/dev/null"
@@ -766,6 +780,27 @@ find "$(git -C "$TD3" rev-parse --absolute-git-dir)" "$TD3" -exec touch -h -t 20
 out=$("$WT" gc --apply 2>&1)
 check "gc --apply도 지우기 전에 실행(스크립트 없는 레인은 메인 폴더 것)" bash -c "[ ! -e '$TD3' ] && grep -F '$TD3|$R' '$TD_LOG' >/dev/null"
 git -C "$R" branch -q -D td-old 2>/dev/null || true   # 레인이 지워지면 기준이 아니게 돼 gc가 이미 지웠을 수 있다
+
+scene "⑬ git 위치 환경(GIT_DIR 등, git 훅 안에서 부른 경우): 시작 때 절대 위치로 옮기고 지워 맞는 저장소·워크트리를 다룸"
+E1=$(start env-rel); echo e1 >"$E1/e1.txt"; commit "$E1" "env e1"; mkdir -p "$E1/sub"
+rc=0; out=$(cd "$E1/sub" && GIT_DIR="../../../$(basename "$R")/.git/worktrees/env-rel" "$WT" finish 2>&1) || rc=$?
+git -C "$R" fetch -q origin
+check "상대 GIT_DIR(하위 폴더에서 워크트리 git 폴더)로 finish 머지·정리" bash -c "[ $rc = 0 ] && git -C '$R' cat-file -e origin/main:e1.txt && [ ! -e '$E1' ]"
+E2=$(start env-wt); echo e2 >"$E2/e2.txt"; commit "$E2" "env e2"
+rc=0; out=$(cd "$T" && GIT_DIR="$R/.git/worktrees/env-wt" GIT_WORK_TREE="$E2" "$WT" finish 2>&1) || rc=$?
+git -C "$R" fetch -q origin
+check "GIT_DIR + GIT_WORK_TREE(저장소 밖에서)로 finish 머지·정리" bash -c "[ $rc = 0 ] && git -C '$R' cat-file -e origin/main:e2.txt && [ ! -e '$E2' ] && ! git -C '$R' show-ref --verify --quiet refs/heads/wt/env-wt"
+E3=$(start env-gd); runs=$(verify_runs)
+rc=0; out=$(cd "$T" && GIT_DIR="$R/.git/worktrees/env-gd" "$WT" verify 2>&1) || rc=$?
+check "워크트리 git 폴더 GIT_DIR만으로(저장소 밖에서) verify가 그 워크트리를 검증" bash -c "[ $rc = 0 ] && [ \"\$(wc -l <'$VERIFY_LOG' | tr -d ' ')\" = $((runs + 1)) ]"
+check "  └ 검증 기록이 그 워크트리 git 폴더에" [ -s "$R/.git/worktrees/env-gd/wt-verified" ]
+out=$(cd "$E3" && GIT_DIR=../../$(basename "$R")/.git "$WT" list 2>&1) || true
+check "메인 .git을 가리키는 상대 GIT_DIR로 list(다른 워크트리 위치에서)" has "$out" "$E3  wt/env-gd"
+rc=0; out=$(cd "$T" && GIT_DIR="$T/origin.git" "$WT" list 2>&1) || rc=$?
+check "bare 저장소 GIT_DIR로 list" bash -c "[ $rc = 0 ]"
+rc=0; out=$(cd "$T" && GIT_DIR="$T/nowhere.git" "$WT" list 2>&1) || rc=$?
+check "저장소를 못 찾으면 오류" [ "$rc" != 0 ]
+git -C "$R" worktree remove --force "$E3"; git -C "$R" branch -q -D wt/env-gd
 
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
