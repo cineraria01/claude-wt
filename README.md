@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | `wt queue enter <merge\|train\|release> [--priority …] [--wait <초>] --pid <pid> [--max-hold <초>] [--note <글>] [--base <브랜치>] [--lane <이름>]` | 저장소 안 어디서나 | 번호표를 받아 차례를 기다린다. `--pid`(차례를 쥘 프로세스, 보통 스크립트의 `$$`)는 필수이고 1보다 큰 살아 있는 pid여야 한다. 종료 코드 0 + 번호표 ref(차례를 쥔 채 끝남, 그 pid가 살아 있는 동안 갱신), 3 시간 초과(번호표는 지움), 2 `--pid` 없음·잘못됨, 1 실패 |
 | `wt queue leave <번호표 ref>` | 저장소 안 어디서나 | 번호표를 지우고, 차례를 쥐고 있었으면 놓는다(이미 없으면 0) |
 
-"어디서"는 현재 폴더 기준이다. git 위치 환경 변수(`GIT_DIR`·`GIT_WORK_TREE`·`GIT_COMMON_DIR`·`GIT_INDEX_FILE`·`GIT_OBJECT_DIRECTORY`·`GIT_ALTERNATE_OBJECT_DIRECTORIES`, git 훅 안에서 부를 때 등)가 있으면 wt는 시작할 때 그것으로 저장소·워크트리를 절대 경로로 구해 그 폴더로 옮기고(이미 그 안이면 그대로, 그 안의 중첩 워크트리면 맨 위로) 변수를 지운다 — `GIT_WORK_TREE`가 있으면 그것, 없으면 git 폴더에서(워크트리 git 폴더 `<공용>/worktrees/<이름>`은 `gitdir` 파일이 가리키는 워크트리(상대 경로 포함), `core.bare`가 true면 그 폴더, `core.worktree`가 있으면(하위 모듈) 그것, 나머지는 부모). 현재 폴더가 다른 저장소의 작업 폴더 안이면 옮기지 않고 멈춘다. 그래서 상대 경로 `GIT_DIR`도 wt가 다른 폴더로 옮긴 뒤 깨지지 않고, `git -C <다른 워크트리>`가 엉뚱한 저장소를 보지 않는다. 저장소를 못 찾으면 오류로 끝난다. 인증 변수(`GIT_SSH_COMMAND`·`GIT_ASKPASS`·`GIT_CONFIG_*`)는 그대로 둔다.
+"어디서"는 현재 폴더 기준이다. git 위치 환경 변수(`GIT_DIR`·`GIT_WORK_TREE`·`GIT_COMMON_DIR`·`GIT_INDEX_FILE`·`GIT_OBJECT_DIRECTORY`·`GIT_ALTERNATE_OBJECT_DIRECTORIES`, git 훅 안에서 부를 때 등)가 있으면 wt는 시작할 때 그것으로 저장소·워크트리를 절대 경로로 구해 그 폴더로 옮기고(이미 그 안이면 그대로, 그 안의 중첩 워크트리면 맨 위로) 변수를 지운다 — `GIT_WORK_TREE`가 있으면 그것, 없으면 git 폴더에서(워크트리 git 폴더 `<공용>/worktrees/<이름>`은 `gitdir` 파일이 가리키는 워크트리(상대 경로 포함), `core.bare`가 true면 그 폴더, `core.worktree`가 있으면(하위 모듈) 그것, 나머지는 부모). 현재 폴더가 다른 저장소의 작업 폴더 안이면 옮기지 않고 멈춘다. 대상 워크트리 안에 있는 별개 저장소(gitignore된 clone 등)에서 `GIT_DIR`로 바깥 저장소를 가리켜 불러도 같은 이유로 멈춘다. 그래서 상대 경로 `GIT_DIR`도 wt가 다른 폴더로 옮긴 뒤 깨지지 않고, `git -C <다른 워크트리>`가 엉뚱한 저장소를 보지 않는다. 저장소를 못 찾으면 오류로 끝난다. 인증 변수(`GIT_SSH_COMMAND`·`GIT_ASKPASS`·`GIT_CONFIG_*`)는 그대로 둔다.
 
 ## 5. `wt finish` 순서
 
@@ -319,7 +319,7 @@ curl -fsSL https://raw.githubusercontent.com/cineraria01/claude-wt/main/install.
 | 항목 | 이유 |
 |---|---|
 | macOS 또는 Linux, bash, curl | 설치·도구 실행 |
-| git **2.38 이상** | squash 반영 판정·줄 단위 충돌 예고가 `git merge-tree --write-tree`를 쓴다(미만이면 충돌 예고는 파일 단위) |
+| git **2.38 이상** (최소 2.31) | squash 반영 판정·줄 단위 충돌 예고가 `git merge-tree --write-tree`를 쓴다(미만이면 충돌 예고는 파일 단위). 2.31 미만은 지원하지 않는다: git 위치 환경 처리(4절)가 `rev-parse --path-format=absolute`를 쓴다 |
 | `/usr/bin/python3` | 훅이 JSON 입출력에 쓴다. 경로가 다르면 설치가 경고하니 훅 안의 경로를 바꾼다 |
 | `gh` (로그인된 상태, 선택) | GitHub 원격이면 PR 생성·squash 머지. 없거나 GitHub가 아니면 로컬 squash 후 push |
 | Claude Code 프로세스 이름이 `claude` | 소유 표식이 부모 프로세스 중 `ps -o comm=`이 `claude`인 것을 찾는다. `node`로 보이는 설치라면 세션 구분이 동작하지 않는다(나머지는 동작) |

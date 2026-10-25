@@ -361,6 +361,8 @@ qempty() { [ -z "$(git ls-remote "$G" 'refs/wt-queue/*')" ]; }
 # 대기열 번호표 수(_head 제외)가 n이 될 때까지 기다린다(최대 15초).
 qwait_n() { local c; for _ in $(seq 1 30); do c=$(git ls-remote "$G" 'refs/wt-queue/main/*' | grep -vc '/_head$' || true); [ "$c" = "$1" ] && return 0; sleep 0.5; done; return 1; }
 wq() { (cd "$GR" && PATH="$T/bin:$PATH" exec "$WT" queue "$@"); }
+# 정리용 leave: 앞 단계가 실패해 번호표 ref가 비었거나 다른 글이면 부르지 않는다(사용법 오류로 스위트가 멈추지 않게)
+wql() { case ${1-} in refs/wt-queue/*) wq leave "$1" ;; esac; }
 untilf() { for _ in $(seq 1 30); do grep -F -- "$2" "$1" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
 ELSE="rm -rf '$T/gh-else' && git clone -q '$G' '$T/gh-else' && (cd '$T/gh-else' && echo \$RANDOM >else-\$RANDOM.txt && git add -A && git commit -qm else && git push -q origin main)"
 F1=$(gstart f1); echo f1 >"$F1/f1.txt"; commit "$F1" "f1 추가"
@@ -414,7 +416,7 @@ H1=$(gstart h1); echo h1 >"$H1/h1.txt"; commit "$H1" "h1 추가"
 (cd "$GR" && PATH="$T/bin:$PATH" exec "$WT" train h1 f3 >"$T/train.out" 2>&1) & WP=$!
 untilf "$T/train.out" "머지 순번"
 check "train은 번호표 하나(kind train, 레인 메모)" bash -c "printf '%s\n' \"\$1\" | grep -E '^  2\. normal  .*  train  \(0분째\)  refs/wt-queue/main/.*  h1 f3$' >/dev/null" _ "$(wq 2>&1)"
-wq leave "$REL"
+wql "$REL"
 rc=0; wait "$WP" || rc=$?
 git -C "$GR" fetch -q origin
 check "  └ 공개가 놓은 뒤 train 머지" bash -c "[ $rc = 0 ] && git -C '$GR' cat-file -e origin/main:h1.txt && git -C '$GR' cat-file -e origin/main:f3.txt"
@@ -437,15 +439,15 @@ bgq hd release; PD=$!; qwait_n 4
 bgq he merge; PE=$!; qwait_n 5
 check "차례 쥔 normal 맨 앞, 그다음 critical → release → normal(먼저 온 순)" [ "$(order)" = "ha hc hd hb he" ]
 check "  └ 기다리는 쪽은 아직 출력 없음" bash -c "[ ! -s '$T/q-hc.out' ] && [ ! -s '$T/q-hb.out' ]"
-wq leave "$QA"
+wql "$QA"
 check "놓으면 critical이 차례를 받음" untilf "$T/q-hc.out" "refs/wt-queue/main/"
 check "  └ 나머지는 그대로 기다림" bash -c "[ ! -s '$T/q-hd.out' ] && [ ! -s '$T/q-hb.out' ]"
 bgq hf merge --priority critical; qwait_n 5
 check "차례 쥔 critical 뒤에 새 critical, 그다음 release·normal" [ "$(order)" = "hc hf hd hb he" ]
-wq leave "$(cat "$T/q-hc.out")"
+wql "$(cat "$T/q-hc.out")"
 check "다음 차례는 새 critical" untilf "$T/q-hf.out" "refs/wt-queue/main/"
 kill "$PB" "$PD" "$PE" 2>/dev/null; wait "$PB" "$PD" "$PE" 2>/dev/null || true
-wq leave "$(cat "$T/q-hf.out")"
+wql "$(cat "$T/q-hf.out")"
 check "기다리다 끝난 enter는 번호표를 지움" qempty
 
 scene "⑫-4 낡은 번호표·시간 초과"
@@ -461,7 +463,7 @@ rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 10 2>&1) || rc=$?
 check "40분 된 다른 기계 merge 차례는 넘겨받음" [ "$rc" = 0 ]
 check "  └ 경고" has "$out" "경고: 낡은 번호표를 지웁니다(main/$O1)"
 check "  └ 낡은 번호표 지워짐" [ -z "$(git ls-remote "$G" "refs/wt-queue/main/$O1")" ]
-wq leave "$(printf '%s\n' "$out" | tail -n 1)"
+wql "$(printf '%s\n' "$out" | tail -n 1)"
 O2=$(qat elsewhere 1 release 1200 1500)
 s=$(date +%s); rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 2 2>&1) || rc=$?
 check "20분 된 다른 기계 release는 낡지 않음 → 시간 초과 3" [ "$rc" = 3 ]
@@ -473,7 +475,7 @@ git -C "$GR" push -q origin ":refs/wt-queue/main/$O2"
 O2=$(qat elsewhere 1 release 2400)
 rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 10 2>&1) || rc=$?
 check "release도 30분이 넘으면 넘겨받음(90분 폐지)" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '낡은 번호표를 지웁니다(main/$O2)' >/dev/null" _ "$out"
-wq leave "$(printf '%s\n' "$out" | tail -n 1)"
+wql "$(printf '%s\n' "$out" | tail -n 1)"
 O3=$(qat hx "$DEAD" merge 0)
 rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
 check "같은 host의 끝난 pid라도 갱신이 신선하면 지우지 않음(3)" [ "$rc" = 3 ]
@@ -482,7 +484,7 @@ git -C "$GR" push -q origin ":refs/wt-queue/main/$O3"
 O3=$(qat hx "$DEAD" merge 10)
 rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 10 2>&1) || rc=$?
 check "같은 host의 끝난 pid + 갱신이 주기 3배(6초) 넘게 멈춤 → 넘겨받음" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '낡은 번호표를 지웁니다(main/$O3)' >/dev/null" _ "$out"
-wq leave "$(printf '%s\n' "$out" | tail -n 1)"
+wql "$(printf '%s\n' "$out" | tail -n 1)"
 O4=$(qat elsewhere "$DEAD" merge 0)
 rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
 check "다른 host의 pid는 끝났는지 몰라 넘겨받지 않음(3)" [ "$rc" = 3 ]
@@ -491,7 +493,7 @@ git -C "$GR" push -q origin ":refs/wt-queue/main/$O4"
 O4=$(qat elsewhere 1 merge 200); qhead "$O4"
 rc=0; out=$(WT_HOST=hx wq enter merge --pid $$ --wait 10 2>&1) || rc=$?
 check "갱신 없는 다른 host 번호표(차례 쥠)는 주기 3배 + 여유 뒤 넘겨받음" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '낡은 번호표를 지웁니다(main/$O4)' >/dev/null" _ "$out"
-wq leave "$(printf '%s\n' "$out" | tail -n 1)"
+wql "$(printf '%s\n' "$out" | tail -n 1)"
 O4=$(qat elsewhere 1 merge 100)
 rc=0; WT_HOST=hx wq enter merge --pid $$ --wait 1 >/dev/null 2>&1 || rc=$?
 check "  └ 여유(주기 3배 + 120초) 안이면 넘겨받지 않음(3)" [ "$rc" = 3 ]
@@ -513,7 +515,7 @@ sleep 300 & SP3=$!
 QR=$(WT_HOST=hb WT_QUEUE_BEAT=20 wq enter merge --pid "$SP3" 2>/dev/null) || true
 check "번호표를 받자마자(첫 주기 20초 전) 표식 달린 갱신이 올라감" bash -c "for _ in \$(seq 1 20); do git --git-dir='$G' log -1 --format=%s '$QR' 2>/dev/null | grep -F ' beat=1 note=' >/dev/null && exit 0; sleep 0.5; done; exit 1"
 check "  └ 표식이 있어도 목록은 그대로(메모 칸에 표식 없음)" bash -c "printf '%s\n' \"\$1\" | grep -E '^  1\. normal  hb  merge  \(0분째\) \[차례\]  $QR  $' >/dev/null" _ "$(wq 2>&1)"
-wq leave "$QR"; kill "$SP3"; wait "$SP3" 2>/dev/null || true
+wql "$QR"; kill "$SP3"; wait "$SP3" 2>/dev/null || true
 # 0으로 시작하는 번호(bash 3.2가 8진으로 읽다 셸을 끝냄)
 s=$(cd "$GR" && GIT_COMMITTER_DATE="@$(($(date +%s) - 200)) +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=zero pid=1 at=old kind=merge priority=normal lane=- note=")
 git -C "$GR" push -q origin "$s:refs/wt-queue/main/0999-zero-1"
@@ -535,7 +537,7 @@ chmod a-w "$G/refs/wt-queue/main"; sleep 3   # origin 쓰기 실패 동안 갱�
 ct0=$(git --git-dir="$G" log -1 --format=%ct "$QR")
 chmod u+w "$G/refs/wt-queue/main"; sleep 5
 check "갱신 push가 실패해도 다음 주기에 다시 시도(갱신 시각이 나아감)" [ "$(git --git-dir="$G" log -1 --format=%ct "$QR")" -gt "$ct0" ]
-wq leave "$QR"
+wql "$QR"
 check "leave 뒤 갱신은 스스로 끝나고 번호표를 되살리지 않음" bash -c "sleep 5; [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
 sleep 300 & SP=$!
 QR=$(WT_HOST=hb wq enter release --pid "$SP" 2>/dev/null)
@@ -583,7 +585,7 @@ QR=$(WT_HOST=hb wq enter release --pid $$ --wait 0 --max-hold 1 2>/dev/null)
 sleep 5; ct0=$(git --git-dir="$G" log -1 --format=%ct "$QR"); sleep 5
 check "--max-hold가 지나면 pid가 살아 있어도 갱신을 멈춤" [ "$(git --git-dir="$G" log -1 --format=%ct "$QR")" = "$ct0" ]
 check "  └ 목록에 [갱신 멈춤]" has "$(wq 2>&1)" "[갱신 멈춤"
-wq leave "$QR"
+wql "$QR"
 O5=$(qat elsewhere 1 merge 0)
 s=$(cd "$GR" && GIT_COMMITTER_DATE="@$(($(date +%s) - 4000)) +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue-head ticket=$O5 at=old")
 git -C "$GR" push -q origin "$s:refs/wt-queue/main/_head"
