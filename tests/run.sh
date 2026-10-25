@@ -15,7 +15,15 @@ unset CLAUDE_CODE_SESSION_ID WT_FORCE_VERIFY WT_FORCE_FINISH
 mkdir -p "$HOME"; : >"$VERIFY_LOG"
 
 pass=0; fail=0
-check() { local d=$1; shift; if "$@"; then echo "  ok   $d"; pass=$((pass + 1)); else echo "  FAIL $d"; fail=$((fail + 1)); fi; }
+# 실패하면 그 장면의 출력($out, 마지막 30줄)을 보인다 — 흔들리는 실패를 다시 돌리지 않고도 원인을 볼 수 있게.
+check() {
+  local d=$1; shift
+  if "$@"; then echo "  ok   $d"; pass=$((pass + 1)); return 0; fi
+  echo "  FAIL $d"; fail=$((fail + 1))
+  [ -z "${out-}" ] || { echo "       | 이 장면의 \$out:"; printf '%s\n' "$out" | tail -n 30 | sed 's/^/       | /'; }
+}
+# 장면 머리: 앞 장면의 $out이 실패 출력에 섞이지 않게 비운다
+scene() { out=""; echo "$1"; }
 has() { printf '%s\n' "$1" | grep -F -- "$2" >/dev/null; }
 hasnt() { ! has "$@"; }
 verify_runs() { wc -l <"$VERIFY_LOG" | tr -d ' '; }
@@ -42,7 +50,7 @@ git push -q origin "$INIT:refs/heads/v2"
 push_from_elsewhere v2 v2.txt "v2 only"
 git fetch -q origin; git branch -q v2 "$INIT"
 
-echo "① 다른 기준 레인의 앞선 수·반영 판정"
+scene "① 다른 기준 레인의 앞선 수·반영 판정"
 V1=$(start v2-a --base v2)
 echo lane >"$V1/c.txt"; commit "$V1" "v2 lane"
 V0=$(start v2-empty --base v2)        # 커밋 없는 v2 레인: v2 기준으론 반영됨, main 기준으론 +1로 오판됐다
@@ -51,7 +59,7 @@ check "v2 레인 +1(main 기준이면 +2)" has "$out" "$V1  wt/v2-a  +1 [기준 
 check "빈 v2 레인 [v2에 반영됨]" has "$out" "$V0  wt/v2-empty  +0 [기준 v2] [v2에 반영됨]"
 check "main 반영 표시가 v2 레인에 안 붙음" hasnt "$out" "[main에 반영됨]"
 
-echo "② 기준으로 쓰이는 브랜치를 gc가 지우지 않음"
+scene "② 기준으로 쓰이는 브랜치를 gc가 지우지 않음"
 git branch -q old-feature "$INIT"     # main에 들어간 평범한 브랜치 → 지워져야 함
 git branch -q release/1 "$INIT"; git config wt.protect "v2 release/*"
 git branch -q long "$INIT"; git push -q origin "$INIT:refs/heads/long"; push_from_elsewhere long l.txt x; git fetch -q origin
@@ -69,7 +77,7 @@ check "wt.protect 없이도 v2 유지" has "$out" "유지(기준 브랜치) 브�
 git config --unset branch.ghost.wtBase; git branch -q -D base2
 check "list에 [기준 브랜치]" has "$("$WT" list 2>&1)" "브랜치만 v2  +0 [기준 브랜치]"
 
-echo "③ wt verify 뒤 같은 트리면 finish가 검증을 건너뜀"
+scene "③ wt verify 뒤 같은 트리면 finish가 검증을 건너뜀"
 echo dirty >>"$V1/c.txt"
 check "미커밋이면 wt verify 거절" bash -c "cd '$V1' && ! '$WT' verify 2>/dev/null"
 (cd "$V1" && git checkout -q -- c.txt)
@@ -94,7 +102,7 @@ echo c3 >"$V3/f.txt"; commit "$V3" "v2 lane c"
 (cd "$V3" && WT_FORCE_VERIFY=1 "$WT" finish >/dev/null 2>&1) || true
 check "WT_FORCE_VERIFY=1이면 같은 트리여도 검증(횟수 5)" [ "$(verify_runs)" = 5 ]
 
-echo "④ 줄 단위 충돌 예고"
+scene "④ 줄 단위 충돌 예고"
 A=$(start lane-a); B=$(start lane-b); C=$(start lane-c)
 sed -i.bak '2s/.*/A2/' "$A/a.txt"; rm "$A/a.txt.bak"; echo a >>"$A/log.txt"; commit "$A" "a: line 2"
 sed -i.bak '2s/.*/B2/' "$B/a.txt"; rm "$B/a.txt.bak"; echo b >>"$B/log.txt"   # B는 미커밋 상태로 둔다
@@ -114,7 +122,7 @@ check "list --conflicts에 레인 쌍 충돌" has "$out" "충돌 예상 $B (wt/l
 out=$(cd "$C" && "$WT" finish 2>&1) || true
 check "finish 시작 때 한 줄 요약" has "$out" "겹치지만 자동 병합 가능"
 
-echo "⑤ 기존 동작 회귀"
+scene "⑤ 기존 동작 회귀"
 # .worktreeinclude 복사가 중간에서 실패하면(뒤 파일은 성공해도) start가 실패해야 한다.
 printf 'aa.secret\nzz.secret\n' >"$R/.worktreeinclude"; printf 'aa.secret\nzz.secret\n.worktreeinclude\n' >"$R/.git/info/exclude"
 mkdir "$R/aa.secret"; : >"$R/aa.secret/x"; chmod 000 "$R/aa.secret"; : >"$R/zz.secret"
@@ -145,7 +153,7 @@ rc=0; out=$(cd "$E" && LC_ALL=en_US.UTF-8 "$WT" finish 2>&1) || rc=$?
 check "커밋 없는 finish가 정리만 하고 성공" [ "$rc" = 0 ]
 check "정리만 안내" has "$out" "새로 들어갈 커밋이 없습니다"
 check "빈 레인 정리됨" [ ! -e "$E" ]
-echo "⑥ 합치기 커밋이 있는 통합 레인"
+scene "⑥ 합치기 커밋이 있는 통합 레인"
 # 두 하위 브랜치가 같은 줄을 고치고 통합 레인이 그 충돌을 merge로 풀었다. rebase는 이를 한 줄로 다시 쌓아 같은 충돌을 또 냈다.
 I=$(start integrate)
 (cd "$I" && git checkout -qb sub1 && sed -i.bak 's/^5$/five-a/' a.txt && rm a.txt.bak && git commit -qam sub1 \
@@ -163,7 +171,7 @@ check "기준이 움직인 통합 레인은 merge로 받아 성공" [ "$rc" = 0 
 check "merge 안내" has "$out" "rebase 대신 origin/main을 merge합니다"
 check "두 레인 내용 모두 main에" bash -c "git -C '$R' cat-file -e origin/main:j1.txt && git -C '$R' cat-file -e origin/main:moved.txt"
 
-echo "⑦ 머지 잠금(flock): 쥔 쪽이 살아 있으면 기다리고, 죽으면 바로 풀림"
+scene "⑦ 머지 잠금(flock): 쥔 쪽이 살아 있으면 기다리고, 죽으면 바로 풀림"
 LOCK="$(cd "$(git -C "$R" rev-parse --git-common-dir)" && pwd -P)/wt-merge.lock"
 hold() { ( exec 9>>"$LOCK"; python3 -I -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'; echo holder >"$LOCK"; exec sleep "$1" ) & }
 hold 300; H=$!; sleep 0.5; kill -9 "$H"; wait "$H" 2>/dev/null || true
@@ -187,7 +195,7 @@ git -C "$R" config --unset core.fsmonitor
 check "git 자식 프로세스가 잠금을 물려받지 않음(바로 다음 finish가 안 기다림)" bash -c "[ $rc = 0 ]" 
 check "  └ 대기 안내 없음" hasnt "$out" "기다립니다"
 
-echo "⑧ wt train: 쌓기·충돌 레인 빼기·검증 한 번·레인별 커밋"
+scene "⑧ wt train: 쌓기·충돌 레인 빼기·검증 한 번·레인별 커밋"
 git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
 T1=$(start t1); echo t1 >"$T1/t1.txt"; commit "$T1" "t1: 새 파일"
 T2=$(start t2); sed -i.bak '10s/.*/T2/' "$T2/a.txt"; rm "$T2/a.txt.bak"; commit "$T2" "t2: 10번 줄"
@@ -213,7 +221,7 @@ rc=0; out=$(cd "$T3" && "$WT" finish 2>&1) || rc=$?
 check "남은 충돌 레인은 finish에서 rebase 충돌" has "$out" "rebase 충돌"
 (cd "$T3" && git rebase --abort)
 
-echo "⑨ wt train: 거절·실패하면 아무것도 머지 안 함"
+scene "⑨ wt train: 거절·실패하면 아무것도 머지 안 함"
 git -C "$R" fetch -q origin; BEFORE=$(git -C "$R" rev-parse origin/main)
 U1=$(start u1); echo u1 >"$U1/u1.txt"; commit "$U1" "u1"
 U2=$(start u2); printf '#!/usr/bin/env bash\nexit 1\n' >"$U2/.claude/wt-verify.sh"; commit "$U2" "u2: 검증 깨짐"
@@ -234,7 +242,7 @@ git -C "$R" worktree lock --reason manual "$U1"
 check "git worktree lock(에이전트 외 사유) 레인은 거절" has "$("$WT" train u1 2>&1 || true)" "잠긴 워크트리입니다"
 git -C "$R" worktree unlock "$U1"
 
-echo "⑩ wt train: 검증 중 레인에 생긴 변경은 지우지 않음"
+scene "⑩ wt train: 검증 중 레인에 생긴 변경은 지우지 않음"
 W1=$(start w1); echo w1 >"$W1/w1.txt"; commit "$W1" "w1"
 W2=$(start w2); echo w2 >"$W2/w2.txt"; commit "$W2" "w2"
 rc=0; out=$(VERIFY_HOOK="(cd '$W1' && echo late >late.txt && git add -A && git commit -qm late); echo dirty >>'$W2/w2.txt'" "$WT" train w1 w2 2>&1) || rc=$?
@@ -244,13 +252,13 @@ check "늦은 커밋은 아직 main에 없음" bash -c "! git -C '$R' cat-file -
 check "두 레인 모두 남음(커밋·미커밋 보존)" bash -c "[ -f '$W1/late.txt' ] && grep -q dirty '$W2/w2.txt'"
 check "남긴 레인 안내" has "$out" "쌓은 뒤 새 커밋·미커밋 변경이 생겨 남긴 레인"
 
-echo "⑪ gc: 강제 종료로 남은 train 통합 워크트리"
+scene "⑪ gc: 강제 종료로 남은 train 통합 워크트리"
 DEAD=$(bash -c 'echo $$')
 git -C "$R" worktree add -q --detach "$R.wt/.train-$DEAD" origin/main
 check "끝난 pid의 .train- 워크트리 정리" has "$("$WT" gc --apply 2>&1)" "정리 대상(끝난 train의 통합 워크트리) $R.wt/.train-$DEAD"
 check "실제로 지워짐" [ ! -e "$R.wt/.train-$DEAD" ]
 
-echo "⑫-0 기계 간 선점: wt claim / unclaim / claims"
+scene "⑫-0 기계 간 선점: wt claim / unclaim / claims"
 cd "$R"
 claim_at() { # 이름 host pid 커밋시각 — 다른 기계·오래된 선점을 직접 만들어 origin에 둔다
   local s; s=$(GIT_COMMITTER_DATE="$4" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt claim $1" -m "host=$2 pid=$3 at=old note=") \
@@ -298,7 +306,7 @@ check "origin 없으면 claim 1 + 안내" bash -c "[ $rc = 1 ] && printf '%s' '$
 check "인자 없는 wt claim은 워크트리 맡기 그대로" has "$(cd "$U1" && "$WT" claim 2>&1)" "이 세션이 $U1 를 맡습니다"
 for n in rel-2 old young dead; do git push -q origin ":refs/wt-claims/$n" 2>/dev/null || true; done
 
-echo "⑫ wt train: GitHub 경로(gh 흉내, 원격 주소에 github.com)"
+scene "⑫ wt train: GitHub 경로(gh 흉내, 원격 주소에 github.com)"
 G="$T/github.com/gh.git"; GS="$T/ghstate"; mkdir -p "$T/github.com" "$GS"
 git clone -q --bare "$T/origin.git" "$G"
 cat >"$T/bin/gh" <<'GH'
@@ -346,8 +354,9 @@ check "메인 폴더 fast-forward" [ -f "$GR/g2.txt" ]
 check "train 머지에 --match-head-commit" has "$(cat "$GS/calls")" "--rebase --match-head-commit"
 check "train 번호표를 지우고 끝남" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
 
-echo "⑫-1 차례를 받은 뒤 재확인: 검증 중에 다른 기계가 main에 머지하면 차례를 쥔 채 다시 올려 검증"
+scene "⑫-1 차례를 받은 뒤 재확인: 검증 중에 다른 기계가 main에 머지하면 차례를 쥔 채 다시 올려 검증"
 export WT_QUEUE_POLL=1 WT_QUEUE_BEAT=2   # 갱신 2초 → 같은 host의 끝난 pid는 갱신이 6초 넘게 멈춰야 낡음
+export WT_QUEUE_LATE=2   # 늦은 반영 재확인 창(기본 30초): 남이 지운 장면의 정리 프로세스가 빨리 끝나게. 늦은 반영 장면만 30초
 qempty() { [ -z "$(git ls-remote "$G" 'refs/wt-queue/*')" ]; }
 # 대기열 번호표 수(_head 제외)가 n이 될 때까지 기다린다(최대 15초).
 qwait_n() { local c; for _ in $(seq 1 30); do c=$(git ls-remote "$G" 'refs/wt-queue/main/*' | grep -vc '/_head$' || true); [ "$c" = "$1" ] && return 0; sleep 0.5; done; return 1; }
@@ -373,7 +382,7 @@ check "  └ 워크트리 남음" [ -d "$F2" ]
 git -C "$GR" fetch -q origin
 check "  └ f2는 main에 없음" bash -c "! git -C '$GR' cat-file -e origin/main:f2.txt 2>/dev/null"
 
-echo "⑫-2 공개 흉내: 다른 기계의 release 번호표가 차례를 쥔 동안 finish·train은 기다렸다 머지"
+scene "⑫-2 공개 흉내: 다른 기계의 release 번호표가 차례를 쥔 동안 finish·train은 기다렸다 머지"
 REL=$(WT_HOST=builder wq enter release --pid $$ --note "공개 흉내" 2>/dev/null)
 check "빈 대기열이면 enter가 바로 번호표 ref 출력" bash -c "[[ '$REL' =~ ^refs/wt-queue/main/[0-9]{13}-builder-$$\$ ]]"
 check "  └ 차례 표시(_head)" [ -n "$(git ls-remote "$G" refs/wt-queue/main/_head)" ]
@@ -418,7 +427,7 @@ check "잘못된 --priority 거절" bash -c "cd '$F4' && ! PATH='$T/bin:$PATH' '
 rc=0; out=$(cd "$F4" && PATH="$T/bin:$PATH" "$WT" finish --priority critical 2>&1) || rc=$?
 check "finish --priority critical 머지" [ "$rc" = 0 ]
 
-echo "⑫-3 순번: 등급 → 번호, 차례를 쥔 번호표는 밀려나지 않음"
+scene "⑫-3 순번: 등급 → 번호, 차례를 쥔 번호표는 밀려나지 않음"
 order() { wq 2>/dev/null | sed -n 's/^  [0-9]*\. [a-z]*  \([^ ]*\) .*/\1/p' | paste -sd ' ' -; }
 QA=$(WT_HOST=ha wq enter merge --pid $$ 2>/dev/null)
 bgq() { local h=$1; shift; (cd "$GR" && WT_HOST=$h PATH="$T/bin:$PATH" exec "$WT" queue enter "$@" --pid $$ --wait 60 >"$T/q-$h.out" 2>/dev/null) & }
@@ -439,7 +448,7 @@ kill "$PB" "$PD" "$PE" 2>/dev/null; wait "$PB" "$PD" "$PE" 2>/dev/null || true
 wq leave "$(cat "$T/q-hf.out")"
 check "기다리다 끝난 enter는 번호표를 지움" qempty
 
-echo "⑫-4 낡은 번호표·시간 초과"
+scene "⑫-4 낡은 번호표·시간 초과"
 # 다른 기계 번호표를 직접 만든다: host pid kind 몇 초 전 → 번호 출력
 qat() { local at=$(($(date +%s) - $4)) s id; id="${at}000-$1-$2"
   s=$(cd "$GR" && GIT_COMMITTER_DATE="@$at +0000" git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=$1 pid=$2 at=old kind=$3 priority=normal lane=- note=")
@@ -481,7 +490,7 @@ check "origin 없으면 queue 1" bash -c "cd '$T/noorigin' && ! '$WT' queue 2>/d
 check "잘못된 kind 거절" bash -c "! (cd '$GR' && '$WT' queue enter deploy 2>/dev/null)"
 check "빈 목록" has "$(wq 2>&1)" "비어 있음"
 
-echo "⑫-5 --pid 필수·갱신 재시도·pid가 끝나면 지움·차례 잃음·옛 판 머지 선점"
+scene "⑫-5 --pid 필수·갱신 재시도·pid가 끝나면 지움·차례 잃음·옛 판 머지 선점"
 qgone() { for _ in $(seq 1 30); do qempty && return 0; sleep 0.5; done; return 1; }
 rc=0; (cd "$GR" && exec "$WT" queue enter release >/dev/null 2>&1) || rc=$?
 check "--pid 없는 enter는 사용법 오류 2" [ "$rc" = 2 ]
@@ -530,7 +539,7 @@ git -C "$GR" fetch -q origin
 check "train: 옛 선점을 기다리는 사이 main이 움직이면 머지하지 않고 멈춤" bash -c "[ $rc = 1 ] && grep -F '검증하는 사이 origin/main이 움직여 머지하지 않았습니다' '$T/train.out' >/dev/null && ! git -C '$GR' cat-file -e origin/main:h2.txt 2>/dev/null"
 check "  └ 대기열 비움" qgone
 
-echo "⑫-6 오래 사는 --pid: init·끝난 pid 거절, 갱신 상한, 오래 쥔 차례 표시"
+scene "⑫-6 오래 사는 --pid: init·끝난 pid 거절, 갱신 상한, 오래 쥔 차례 표시"
 rc=0; (cd "$GR" && exec "$WT" queue enter release --pid 1 >/dev/null 2>&1) || rc=$?
 check "--pid 1 거절(2)" bash -c "[ $rc = 2 ] && [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
 rc=0; (cd "$GR" && exec "$WT" queue enter release --pid "$DEAD" >/dev/null 2>&1) || rc=$?
@@ -547,12 +556,18 @@ check "1시간 넘게 쥔 차례 표시" has "$(wq 2>&1)" "[차례 66분째 쥠 
 git -C "$GR" push -q origin ":refs/wt-queue/main/_head" ":refs/wt-queue/main/$O5"
 check "  └ 대기열 비움" qgone
 
-echo "⑫-6b 놓기 실패(네트워크 끊김): 갱신은 멈추고 백그라운드가 다시 지움 — 남의 번호표·차례·다른 sha는 건드리지 않음"
-# 끊김 흉내 git: $T/nopush가 있으면 push만 실패(읽기는 됨), $T/lostack이 있으면 push는 올라가는데 실패로 보이고 ls-remote도 실패
+scene "⑫-6b 놓기 실패(네트워크 끊김): 갱신은 멈추고 백그라운드가 다시 지움 — 남의 번호표·차례·다른 sha는 건드리지 않음"
+# 끊김 흉내 git: $T/nopush가 있으면 push만 실패(읽기는 됨), $T/lostack이 있으면 push는 올라가는데 실패로 보이고 ls-remote도 실패,
+# $T/lateack이 있으면 push는 실패로 보이고 $T/land가 생긴 뒤에야 서버에 반영된다. $T/lslog가 있으면 끝난 ls-remote마다 한 줄 남긴다.
 mkdir -p "$T/gitfail"
 cat >"$T/gitfail/git" <<GITFAIL
 #!/usr/bin/env bash
 [ "\${1-}" = push ] && [ -f "$T/nopush" ] && exit 1
+[ "\${1-}" = push ] && [ -f "$T/lateack" ] && { (i=0; until [ -f "$T/land" ]; do i=\$((i + 1)); [ \$i -le 600 ] || exit 1; sleep 0.1; done; "$(command -v git)" "\$@"; touch "$T/landed") </dev/null >/dev/null 2>&1 & exit 1; }
+# $T/droplog가 있으면 q_drop 임시 ref 이름의 pid가 부른 셸(PPID) 자신인지 남긴다(ok / bad <이름 pid> <PPID>)
+if [ "\${1-}" = fetch ] && [ -f "$T/droplog" ]; then case "\$*" in *refs/wt-queue-drop/*) n="\$*"; n=\${n##*refs/wt-queue-drop/}; n=\${n%%-*}
+  if [ "\$n" = "\$PPID" ]; then echo ok >>"$T/droplog"; else echo "bad \$n \$PPID" >>"$T/droplog"; fi ;; esac; fi
+[ "\${1-}" = ls-remote ] && [ -f "$T/lslog" ] && { "$(command -v git)" "\$@"; r=\$?; echo x >>"$T/lslog"; exit \$r; }
 [ "\${1-}" = push ] && [ -f "$T/lostack" ] && { "$(command -v git)" "\$@"; exit 1; }
 [ "\${1-}" = ls-remote ] && [ -f "$T/lostack" ] && exit 1
 exec "$(command -v git)" "\$@"
@@ -644,9 +659,50 @@ touch "$T/nopush"; rc=0; wqf leave "$QR" >/dev/null 2>&1 || rc=$?
 check "leave 실패는 1, 번호표 남음" bash -c "[ $rc = 1 ] && [ -n \"\$(git ls-remote '$G' '$QR')\" ]"
 rm -f "$T/nopush"
 check "  └ 연결이 돌아오면 번호표·차례 지움" qgone
+# 번호표 push가 실패로 보였는데 서버 반영이 정리 프로세스의 첫 조회보다 늦으면: 빈 결과를 더 보다가 늦게 들어온 번호표를 지운다
+rm -f "$T/land" "$T/landed"; : >"$T/lslog"; touch "$T/lateack"
+rc=0; WT_HOST=hb WT_QUEUE_LATE=30 wqf enter release --pid "$SP" >/dev/null 2>&1 || rc=$?
+rm -f "$T/lateack"
+for _ in $(seq 1 300); do [ -s "$T/lslog" ] && break; sleep 0.1; done
+touch "$T/land"
+check "늦게 반영된 번호표 push: enter 1, 정리 프로세스가 반영 전에 한 번 조회함" bash -c "[ $rc = 1 ] && [ -s '$T/lslog' ]"
+check "  └ 첫 조회 뒤에 반영된 번호표도 지움" bash -c "for _ in \$(seq 1 60); do [ -f '$T/landed' ] && [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ] && exit 0; sleep 0.5; done; exit 1"
+rm -f "$T/lslog" "$T/land" "$T/landed"
+# 부른 쪽이 상대 경로 GIT_DIR(git 훅 안 등)를 주어도 갱신·정리는 git 공용 폴더에서 git을 찾는다
+sleep 300 & SP2=$!
+QR=$(cd "$GR" && GIT_DIR=.git WT_HOST=hb PATH="$T/bin:$PATH" "$WT" queue enter release --pid "$SP2" 2>/dev/null)
+kill "$SP2"; wait "$SP2" 2>/dev/null || true
+check "상대 경로 GIT_DIR=.git으로 enter 성공" [ -n "$QR" ]
+check "  └ --pid가 끝나면 갱신이 번호표·차례 지움" qgone
+QR=$(WT_HOST=hb wq enter release --pid "$SP" 2>/dev/null)
+touch "$T/nopush"; rc=0; (cd "$GR" && GIT_DIR=.git PATH="$T/gitfail:$T/bin:$PATH" exec "$WT" queue leave "$QR") >/dev/null 2>&1 || rc=$?
+rm -f "$T/nopush"
+check "상대 경로 GIT_DIR=.git으로 부른 leave가 실패해도 백그라운드가 지움" bash -c "[ $rc = 1 ]"
+check "  └ 번호표·차례 지움" qgone
+# 갱신은 부른 쪽이 연 fd를 물려받지 않는다 — 명령 치환 파이프를 fd 3·200으로 넘기면 물려받은 갱신이 --pid가 끝날 때까지 붙든다
+for fd in 3 200; do
+  sleep 30 & SP2=$!
+  s=$(date +%s); QR=$(cd "$GR" && export WT_HOST=hb PATH="$T/bin:$PATH" && eval "\"\$WT\" queue enter release --pid $SP2 $fd>&1 >/dev/null 2>&1"); el=$(($(date +%s) - s))
+  check "갱신이 부른 쪽 fd ${fd}를 물려받지 않음(명령 치환이 --pid(30초)보다 먼저 끝남)" [ "$el" -le 15 ]
+  kill "$SP2" 2>/dev/null; wait "$SP2" 2>/dev/null || true
+  check "  └ 번호표·차례 지움" qgone
+done
+# 백그라운드 정리의 q_drop 임시 ref 이름은 부모 pid가 아니라 자기 pid — 부모가 끝난 뒤 다른 wt의 청소가 쓰는 중인 ref를 지우지 않게
+sleep 300 & SP2=$!
+QR=$(WT_HOST=hb wqf enter release --pid "$SP2" 2>/dev/null)
+: >"$T/droplog"; kill "$SP2"; wait "$SP2" 2>/dev/null || true
+check "--pid가 끝나 갱신이 번호표·차례 지움" qgone
+out=$(cat "$T/droplog"); rm -f "$T/droplog"
+check "  └ 그 q_drop 임시 ref 이름의 pid가 갱신 프로세스 자신" bash -c "printf '%s\n' \"\$1\" | grep -x ok >/dev/null && ! printf '%s\n' \"\$1\" | grep bad >/dev/null" _ "$out"
+# q_drop이 fetch와 지우기 사이에 죽어 남긴 임시 ref: pid가 끝났으면 q_scan이 치운다
+git -C "$GR" update-ref "refs/wt-queue-drop/$DEAD-1" HEAD; git -C "$GR" update-ref "refs/wt-queue-drop/$$-1" HEAD
+wq >/dev/null 2>&1
+check "끝난 pid의 임시 ref(refs/wt-queue-drop/)는 q_scan이 치움" [ -z "$(git -C "$GR" for-each-ref "refs/wt-queue-drop/$DEAD-1")" ]
+check "  └ 살아 있는 pid의 것은 둠" [ -n "$(git -C "$GR" for-each-ref "refs/wt-queue-drop/$$-1")" ]
+git -C "$GR" update-ref -d "refs/wt-queue-drop/$$-1"
 kill "$SP"; wait "$SP" 2>/dev/null || true
 
-echo "⑫-7 기계 간 같은 이름 레인: start 거부·finish가 남의 브랜치를 덮어쓰지 않음"
+scene "⑫-7 기계 간 같은 이름 레인: start 거부·finish가 남의 브랜치를 덮어쓰지 않음"
 OC="$T/othermachine"; git clone -q "$G" "$OC"
 opush() { (cd "$OC" && git fetch -q origin && git checkout -q -B "$1" origin/main && echo "$2" >"$2.txt" && git add -A && git commit -qm "$2" && git push -q -f origin "$1"); }
 opush wt/dup dup-o
@@ -676,11 +732,12 @@ git -C "$GR" fetch -q origin
 check "(d) 원격 브랜치가 없으면(낡은 추적 ref가 있어도) 첫 push·머지" bash -c "[ $rc = 0 ] && git -C '$GR' cat-file -e origin/main:d7.txt"
 git -C "$OC" remote set-url origin "$T/nowhere.git"
 rc=0; out=$(cd "$OC" && "$WT" start off 2>&1) || rc=$?
-check "origin을 못 보면(오프라인) 경고만 하고 start 진행" bash -c "[ $rc = 0 ] && [ -d '$OC.wt/off' ]" && check "  └ 경고" has "$out" "확인하지 못했습니다"
+check "origin을 못 보면(오프라인) 경고만 하고 start 진행" bash -c "[ $rc = 0 ] && [ -d '$OC.wt/off' ]"
+check "  └ 경고" has "$out" "확인하지 못했습니다"
 git --git-dir="$G" update-ref -d refs/heads/wt/dup; git --git-dir="$G" update-ref -d refs/heads/wt/b7
 git -C "$GR" worktree remove --force "$B7"; git -C "$GR" branch -q -D wt/b7
 
-echo "⑦ gc의 24시간 판정은 status가 건드리는 파일을 사용 흔적으로 안 본다"
+scene "⑦ gc의 24시간 판정은 status가 건드리는 파일을 사용 흔적으로 안 본다"
 OLD=$(start gc-old); FRESH=$(start gc-fresh)
 OGD=$(git -C "$OLD" rev-parse --absolute-git-dir)
 find "$OGD" "$OLD" -exec touch -h -t 202001010000 {} + 2>/dev/null
@@ -690,7 +747,7 @@ check "오래된 레인은 status 뒤에도 정리 대상" has "$out" "정리 �
 check "방금 만든 레인은 24시간 내 사용으로 유지" has "$out" "유지(24시간 내 사용) $FRESH"
 git -C "$R" worktree remove --force "$FRESH" 2>/dev/null || true; git -C "$R" branch -D wt/gc-fresh >/dev/null 2>&1 || true
 
-echo "⑧ .claude/wt-teardown.sh: 워크트리를 지우기 직전에 그 안에서 실행, 실패해도 정리는 계속"
+scene "⑧ .claude/wt-teardown.sh: 워크트리를 지우기 직전에 그 안에서 실행, 실패해도 정리는 계속"
 TD_LOG="$T/teardown.log"; : >"$TD_LOG"; export TD_LOG
 (cd "$R" && git pull -q --ff-only origin main \
   && printf '#!/usr/bin/env bash\necho "$PWD|$WT_MAIN" >>"$TD_LOG"\n[ -z "${TEARDOWN_FAIL-}" ]\n' >.claude/wt-teardown.sh \
