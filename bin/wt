@@ -472,7 +472,8 @@ q_enter() {
 # 부른 쪽이 연 fd(exec 200>lock 등), INT·TERM 트랩이 셸 함수 git·gh의 리다이렉션 도중에 돌 때 bash 3.2가 10 이상에 보관해 둔 사본.
 q_bg() {
   local d=$1; shift
-  ( for f in /dev/fd/*; do f=${f##*/}; [ "$f" -gt 2 ] 2>/dev/null && { eval "exec $f>&-" || :; }; done 2>/dev/null
+  # 루프 전체에 2>/dev/null을 붙이지 않는다: bash가 원래 stderr를 10 이상에 보관한 채 루프가 그 사본까지 닫아 루프 뒤 stderr가 돌아오지 않는다.
+  ( for f in /dev/fd/*; do f=${f##*/}; [ "$f" -gt 2 ] 2>/dev/null && { eval "exec $f>&-" || :; }; done
     WT_Q_SELF=$(exec sh -c 'echo $PPID')   # exec: sh의 부모가 이 서브셸이 된다
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
     cd "$d" && "$@" ) >/dev/null 2>&1 &
