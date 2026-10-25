@@ -547,6 +547,105 @@ check "1시간 넘게 쥔 차례 표시" has "$(wq 2>&1)" "[차례 66분째 쥠 
 git -C "$GR" push -q origin ":refs/wt-queue/main/_head" ":refs/wt-queue/main/$O5"
 check "  └ 대기열 비움" qgone
 
+echo "⑫-6b 놓기 실패(네트워크 끊김): 갱신은 멈추고 백그라운드가 다시 지움 — 남의 번호표·차례·다른 sha는 건드리지 않음"
+# 끊김 흉내 git: $T/nopush가 있으면 push만 실패(읽기는 됨), $T/lostack이 있으면 push는 올라가는데 실패로 보이고 ls-remote도 실패
+mkdir -p "$T/gitfail"
+cat >"$T/gitfail/git" <<GITFAIL
+#!/usr/bin/env bash
+[ "\${1-}" = push ] && [ -f "$T/nopush" ] && exit 1
+[ "\${1-}" = push ] && [ -f "$T/lostack" ] && { "$(command -v git)" "\$@"; exit 1; }
+[ "\${1-}" = ls-remote ] && [ -f "$T/lostack" ] && exit 1
+exec "$(command -v git)" "\$@"
+GITFAIL
+chmod +x "$T/gitfail/git"
+wqf() { (cd "$GR" && PATH="$T/gitfail:$T/bin:$PATH" exec "$WT" queue "$@"); }
+qref() { git ls-remote "$G" "$1" | cut -f1; }
+# 그 인자로 띄운 wt(정리 프로세스 포함)가 남아 있는지
+wtproc() { ps -A -o args= | grep -F -- "queue enter $1" | grep -v grep >/dev/null; }
+nowtproc() { for _ in 1 2 3 4 5 6; do wtproc "$1" || return 0; sleep 0.5; done; return 1; }
+qgone_ref() { for _ in $(seq 1 30); do [ -z "$(qref "$1")" ] && return 0; sleep 0.5; done; return 1; }
+sleep 300 & SP=$!
+O6=$(qat elsewhere 1 merge 0)
+# 명령 치환으로 부른다: 시간 초과로 끝날 때 정리 프로세스가 남아도 부른 쪽은 기다리지 않아야 한다
+(s=$(date +%s); rc=0; out=$(WT_HOST=hb wqf enter merge --pid "$SP" --wait 7 2>&1) || rc=$?
+ echo "$rc $(($(date +%s) - s))" >"$T/rc6"; printf '%s\n' "$out" >"$T/err6") & WP=$!
+qwait_n 2; touch "$T/nopush"; wait "$WP" || true
+MY=$(git ls-remote "$G" 'refs/wt-queue/main/*' | cut -f2 | grep -v "/$O6\$")
+read -r rc6 el6 <"$T/rc6"
+check "시간 초과(3) 때 놓기 실패 → 오래 사는 --pid의 번호표가 남음" bash -c "[ '$rc6' = 3 ] && [ -n '$MY' ] && [ -n \"\$(git ls-remote '$G' '$MY')\" ]"
+check "  └ 백그라운드 정리 프로세스가 돌고 있음" wtproc "merge --pid $SP --wait 7"
+check "  └ 명령 치환이 정리 프로세스를 기다리지 않음(7초 기다림 + 여유 5초 안)" [ "$el6" -le 12 ]
+check "  └ 경고가 보임" grep -F "백그라운드에서 다시 지웁니다" "$T/err6"
+rm -f "$T/nopush"
+check "  └ 연결이 돌아오면 백그라운드가 지움(--pid는 아직 살아 있음)" qgone_ref "$MY"
+check "  └ 남의 번호표는 그대로" [ -n "$(qref "refs/wt-queue/main/$O6")" ]
+sleep 3
+check "  └ 지운 뒤 되살아나지 않음" [ -z "$(qref "$MY")" ]
+check "  └ 정리 프로세스도 끝남" nowtproc "merge --pid $SP --wait 7"
+# 그사이 남이 내 번호표를 지우고 다른 번호표가 차례를 쥐었으면 아무것도 지우지 않고 끝난다
+(WT_HOST=hb wqf enter merge --pid "$SP" --wait 4 >/dev/null 2>&1) & WP=$!
+qwait_n 2; touch "$T/nopush"; wait "$WP" || true
+MY=$(git ls-remote "$G" 'refs/wt-queue/main/*' | cut -f2 | grep -v "/$O6\$")
+git -C "$GR" push -q origin ":$MY"; qhead "$O6"; H6=$(qref refs/wt-queue/main/_head)
+rm -f "$T/nopush"; sleep 3
+check "남이 지운 뒤 남의 번호표·차례(_head)는 그대로" bash -c "[ -n \"\$(git ls-remote '$G' 'refs/wt-queue/main/$O6')\" ] && [ \"\$(git ls-remote '$G' refs/wt-queue/main/_head | cut -f1)\" = '$H6' ]"
+check "  └ 정리 프로세스는 끝남" nowtproc "merge --pid $SP --wait 4"
+git -C "$GR" push -q origin ":refs/wt-queue/main/_head" ":refs/wt-queue/main/$O6"
+check "  └ 대기열 비움" qgone
+# 상한(WT_QUEUE_REAP)이 지나면 끝난다 — 그 뒤는 30분 낡음 판정이 맡는다
+O6=$(qat elsewhere 1 merge 0)
+(WT_HOST=hb WT_QUEUE_REAP=2 wqf enter merge --pid "$SP" --wait 5 >/dev/null 2>&1) & WP=$!
+qwait_n 2; touch "$T/nopush"; wait "$WP" || true
+MY=$(git ls-remote "$G" 'refs/wt-queue/main/*' | cut -f2 | grep -v "/$O6\$")
+sleep 5; rm -f "$T/nopush"; sleep 3
+check "상한이 지나면 다시 지우지 않고 끝남" bash -c "[ -n \"\$(git ls-remote '$G' '$MY')\" ]"
+check "  └ 정리 프로세스 끝남" nowtproc "merge --pid $SP --wait 5"
+check "  └ 갱신도 멈춰 번호표가 다시 올라가지 않음" [ "$(git --git-dir="$G" log -1 --format=%ct "$MY")" -le "$(($(date +%s) - 7))" ]
+git -C "$GR" push -q origin ":$MY" ":refs/wt-queue/main/$O6"
+# enter 뒤 --pid가 끝났는데 갱신의 놓기가 실패: 갱신이 다시 지우는 쪽으로 넘어간다(번호표·_head 모두)
+sleep 300 & SP2=$!
+QR=$(WT_HOST=hb wqf enter release --pid "$SP2" 2>/dev/null)
+touch "$T/nopush"; kill "$SP2"; wait "$SP2" 2>/dev/null || true; sleep 4
+check "--pid가 끝날 때 놓기 실패 → 번호표·차례 남음" bash -c "[ -n \"\$(git ls-remote '$G' '$QR')\" ] && [ -n \"\$(git ls-remote '$G' refs/wt-queue/main/_head)\" ]"
+rm -f "$T/nopush"
+check "  └ 연결이 돌아오면 번호표·차례 지움" qgone
+# 같은 장면에서 번호표가 다른 sha로 바뀌었으면(lease 어긋남) 건드리지 않는다
+sleep 300 & SP2=$!
+QR=$(WT_HOST=hb wqf enter release --pid "$SP2" 2>/dev/null)
+touch "$T/nopush"; kill "$SP2"; wait "$SP2" 2>/dev/null || true; sleep 4
+s=$(cd "$GR" && git commit-tree "$(git hash-object -t tree -w /dev/null)" -m "wt-queue host=hb pid=1 at=x kind=release priority=release lane=- note=다른 sha")
+git -C "$GR" push -q -f origin "$s:$QR"; H6=$(qref refs/wt-queue/main/_head)
+rm -f "$T/nopush"; sleep 3
+check "다른 sha로 바뀐 번호표와 그 차례는 그대로" bash -c "[ \"\$(git ls-remote '$G' '$QR' | cut -f1)\" = '$s' ] && [ \"\$(git ls-remote '$G' refs/wt-queue/main/_head | cut -f1)\" = '$H6' ]"
+git -C "$GR" push -q origin ":$QR" ":refs/wt-queue/main/_head"
+# 갱신 push가 올라갔는데 실패로 보이고 다시 보기도 실패한 뒤 --pid가 끝나면: 올라간 sha도 내 것으로 보고 지운다
+sleep 300 & SP2=$!
+QR=$(WT_HOST=hb wqf enter release --pid "$SP2" 2>/dev/null); s0=$(qref "$QR")
+touch "$T/lostack"; sleep 3; kill "$SP2"; wait "$SP2" 2>/dev/null || true; sleep 3
+check "갱신 결과를 모르는 사이 --pid 끝남 → 번호표는 새 sha로 남아 있음" bash -c "[ -n \"\$(git ls-remote '$G' '$QR')\" ] && [ \"\$(git ls-remote '$G' '$QR' | cut -f1)\" != '$s0' ]"
+rm -f "$T/lostack"
+check "  └ 연결이 돌아오면 번호표·차례 지움" qgone
+# 번호표 push가 서버에는 들어갔는데 실패로 보이면: enter는 1, 백그라운드가 그 번호표를 지운다
+touch "$T/lostack"; rc=0; WT_HOST=hb wqf enter release --pid "$SP" >/dev/null 2>&1 || rc=$?
+check "번호표 push 결과를 모르면 enter 1, 번호표는 남아 있음" bash -c "[ $rc = 1 ] && [ -n \"\$(git ls-remote '$G' 'refs/wt-queue/main/*')\" ]"
+rm -f "$T/lostack"
+check "  └ 연결이 돌아오면 그 번호표 지움" qgone
+# 부른 쪽 작업 폴더(워크트리)가 지워져도 갱신은 git 공용 폴더에서 돌아 --pid가 끝나면 지운다
+git -C "$GR" worktree add -q --detach "$T/qwt" 2>/dev/null
+sleep 300 & SP2=$!
+QR=$(cd "$T/qwt" && WT_HOST=hb PATH="$T/bin:$PATH" "$WT" queue enter release --pid "$SP2" 2>/dev/null)
+git -C "$GR" worktree remove --force "$T/qwt"
+kill "$SP2"; wait "$SP2" 2>/dev/null || true
+check "부른 워크트리에서 enter 성공" [ -n "$QR" ]
+check "  └ 그 워크트리가 지워진 뒤 --pid가 끝나도 번호표·차례 지움" qgone
+# wt queue leave도 실패하면 1로 끝나되 백그라운드가 마저 지운다
+QR=$(WT_HOST=hb wq enter release --pid "$SP" 2>/dev/null)
+touch "$T/nopush"; rc=0; wqf leave "$QR" >/dev/null 2>&1 || rc=$?
+check "leave 실패는 1, 번호표 남음" bash -c "[ $rc = 1 ] && [ -n \"\$(git ls-remote '$G' '$QR')\" ]"
+rm -f "$T/nopush"
+check "  └ 연결이 돌아오면 번호표·차례 지움" qgone
+kill "$SP"; wait "$SP" 2>/dev/null || true
+
 echo "⑫-7 기계 간 같은 이름 레인: start 거부·finish가 남의 브랜치를 덮어쓰지 않음"
 OC="$T/othermachine"; git clone -q "$G" "$OC"
 opush() { (cd "$OC" && git fetch -q origin && git checkout -q -B "$1" origin/main && echo "$2" >"$2.txt" && git add -A && git commit -qm "$2" && git push -q -f origin "$1"); }
