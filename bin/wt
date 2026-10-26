@@ -555,7 +555,7 @@ q_beat() {
 
 # q_wait <기준(q_base)> <내 번호> <기다릴 초>: 차례를 쥐면 0(WT_Q_HEAD에 _head sha), 시간 초과 3, 실패 1.
 q_wait() {
-  local qb=$1 me=$2 end t hid hsha hct rows k n fails=0 next=0 now fid fs since lane
+  local qb=$1 me=$2 end t hid hsha hct rows k n fails=0 next=0 now fid fs since lane hnext=0
   end=$(($(date +%s) + $3))
   while :; do
     if ! t=$(q_scan "$qb" "$me"); then
@@ -575,8 +575,12 @@ q_wait() {
       fi
       continue   # 그사이 다른 번호표가 차례를 쥐었다
     fi
-    # 자동 묶음 finish: 기다리는 동안 차례를 쥔 쪽이 이 레인까지 함께 머지했으면 4
-    if [ -n "$WT_Q_HOOK" ] && "$WT_Q_HOOK"; then return 4; fi
+    # 자동 묶음 finish: 기다리는 동안 차례를 쥔 쪽이 이 레인까지 함께 머지했으면 4. 원격을 읽으니 30초마다만 본다
+    # (그사이 머지됐으면 차례를 받은 직후의 확인이 알아본다).
+    if [ -n "$WT_Q_HOOK" ] && [ "$(date +%s)" -ge "$hnext" ]; then
+      hnext=$(($(date +%s) + 30))
+      if "$WT_Q_HOOK"; then return 4; fi
+    fi
     now=$(date +%s)
     [ "$now" -lt "$end" ] || return 3
     if [ "$now" -ge "$next" ]; then
@@ -792,7 +796,7 @@ r_show() {
     printf '  %s  %s  %s분 전%s  %s\n' "$sl" "$(r_f host "$subj")" $(((now - ct) / 60)) "$m" "${subj#* note=}"
   done <<<"$1"
 }
-# 자동 묶음 finish가 차례를 기다리는 동안(q_wait의 WT_Q_HOOK): 내 표식이 머지됨(r_is_landed)이면 0(다른 곳이 함께 머지함).
+# 자동 묶음 finish가 차례를 기다리는 동안(q_wait의 WT_Q_HOOK, 30초마다): 내 표식이 머지됨(r_is_landed)이면 0(다른 곳이 함께 머지함).
 # 옛 판 wt는 머지한 표식을 지우므로 표식이 사라졌으면 내용으로 본다. 충돌·검증 실패로 뺐으면 알리고 계속 기다린다 — 내 차례에 직접 올려 검증한다.
 r_merged() {
   local cur; cur=$(r_remote "$WT_READY_REF") || return 1
@@ -1305,6 +1309,8 @@ cmd_finish() {
   local st; st=$(owner_state "$dir")
   case $st in other*) [ "${WT_FORCE_FINISH:-}" = 1 ] || die "다른 세션이 쓰는 워크트리입니다$(owner_label "$st"). 그 세션에서 finish하거나, 끝난 게 확실하면 wt claim --force 후 재실행" ;; esac
   local ov; ov=$(show_overlap "$dir" brief) || say "참고:${ov# }"
+  # kept: 기준에 들어갔다고 판단한(또는 머지한) 레인 커밋. 정리 직전에 HEAD가 이것이고 미커밋 변경이 없어야 워크트리를 지운다.
+  local kept; kept=$(git rev-parse HEAD)
 
   # GitHub면 기계·프로세스 사이 순서는 origin의 머지 대기열이 정한다(rebase·검증은 줄 밖에서 미리). 아니면 이 기계의 flock.
   local queue=0; is_github && type -P gh >/dev/null && queue=1
@@ -1320,7 +1326,7 @@ cmd_finish() {
   else
     onto_upstream "$upstream" "$dir" "$branch"
     verify_if_changed
-    local verified; verified=$(git rev-parse HEAD)   # 묶음에는 검증한 이 커밋을 올린다(그 뒤 HEAD가 움직여도)
+    local verified; verified=$(git rev-parse HEAD) kept=$(git rev-parse HEAD)   # 묶음에는 검증한 이 커밋을 올린다(그 뒤 HEAD가 움직여도)
 
     if [ $queue = 1 ]; then
       # 자동 묶음(git config wt.autobatch, 기본 켬, critical은 제외): 줄에 서기 전에 레인을 준비됨으로 올려 둔다 — 앞에서 차례를
@@ -1349,10 +1355,7 @@ cmd_finish() {
         brc=0; batch_run "$base" "$title" "$branch" "$verified" || brc=$?
         case $brc in
           0|3) single=0; say "묶음 머지 →$B_NAMES"
-               [ $brc = 0 ] || say "충돌로 뺀 레인은 표식에 남겼습니다(wt queue 로 확인, 주인이 그 워크트리에서 wt finish)"
-               # 기다리는 사이 이 레인에 새 커밋·변경이 생겼으면 워크트리를 지우지 않는다(머지한 것은 검증한 커밋까지).
-               [ "$(git rev-parse HEAD)" = "$verified" ] && [ -z "$(git status --porcelain)" ] \
-                 || die "묶음에 올린 뒤 이 레인에 새 커밋·변경이 생겼습니다(머지한 것은 ${verified:0:9}까지). 워크트리는 남겨 둠 — 남은 변경은 wt finish를 다시 실행" ;;
+               [ $brc = 0 ] || say "충돌로 뺀 레인은 표식에 남겼습니다(wt queue 로 확인, 주인이 그 워크트리에서 wt finish)" ;;
           11) say "새 기준 위에 이 레인을 쌓지 못해 묶지 않고 이 레인만 올립니다" ;;
           12) say "묶음 검증이 실패했습니다(함께 쌓은 레인 표식에 기록). 이 레인만 머지합니다" ;;
           13) say "묶음 머지가 막혀 이 레인만 squash 머지합니다" ;;
@@ -1373,6 +1376,7 @@ cmd_finish() {
         verify_if_changed
       done
       q_holding || die "머지 차례를 잃었습니다(오래 걸려 다른 곳이 낡은 번호표로 넘겨받음). wt finish를 다시 실행하세요. 워크트리는 남겨 둠"
+      kept=$(git rev-parse HEAD)
       local msg subject body pr state
       msg=$(squash_message "$upstream" "$title")
       # head -1 파이프는 긴 메시지에서 printf가 SIGPIPE(141)로 죽어 pipefail에 걸린다
@@ -1388,7 +1392,7 @@ cmd_finish() {
       fi
       say "PR #$pr squash 머지"
       # --match-head-commit: 검증한 커밋이 아닌 것(그사이 다른 곳에서 레인 브랜치에 push)은 머지하지 않는다.
-      gh pr merge "$pr" --squash --match-head-commit "$(git rev-parse HEAD)" --subject "$subject" --body "$body" \
+      gh pr merge "$pr" --squash --match-head-commit "$kept" --subject "$subject" --body "$body" \
         || die "머지 실패(보호 규칙·체크 등). PR #$pr 을 확인하세요. 워크트리는 남겨 둠"
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 워크트리는 남겨 둠"
@@ -1401,6 +1405,7 @@ cmd_finish() {
       local msg; msg=$(squash_message "$upstream" "$title")
       git reset --soft "$upstream"
       git commit --quiet -F - <<<"$msg"
+      kept=$(git rev-parse HEAD)
       if has_origin; then
         git push --quiet origin "HEAD:$base" || die "origin/$base 로 push 실패. 워크트리는 남겨 둠"
       fi
@@ -1408,6 +1413,10 @@ cmd_finish() {
     fi
     say "머지 완료 → $base"
   fi
+  # 지우기 전 공통 확인(정리만·묶음·단독 모든 경로): 차례를 기다리거나 머지하는 사이 이 워크트리에 새 커밋·미커밋 변경이
+  # 생겼으면 지우지 않는다 — remove_lane은 --force로 지운다. 표식을 지우기 전에 멈춰 머지됨 표식도 남는다.
+  [ "$(git rev-parse HEAD)" = "$kept" ] && [ -z "$(git status --porcelain)" ] \
+    || die "머지·정리하는 사이 이 워크트리에 새 커밋·미커밋 변경이 생겨 지우지 않았습니다(기준에 들어간 것은 ${kept:0:9}까지). 워크트리는 남겨 둠 — 남은 변경을 커밋한 뒤 wt finish를 다시 실행"
   # 이 레인의 준비됨 표식(이번 finish가 올린 것, 앞서 wt ready로 올린 것, 다른 곳이 충돌로 표시한 것)을 지운다.
   # 이 레인 커밋의 것만(같은 이름으로 다른 기계가 올린 표식은 남긴다). 다른 곳이 남긴 머지됨 표식도 여기서 지운다.
   if has_origin; then

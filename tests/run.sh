@@ -5,7 +5,8 @@ set -euo pipefail
 
 WT="$(cd "$(dirname "$0")/.." && pwd)/bin/wt"
 T=$(cd "$(mktemp -d)" && pwd -P)
-cleanup() { [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null; rm -rf "$T"; }
+# 가짜 claude(sleep 300)는 시험이 5분을 넘기면 먼저 끝난다 — kill 실패가 set -e로 정리를 멈추고 종료 코드를 1로 만들지 않게
+cleanup() { [ -z "${FAKE_PID:-}" ] || kill "$FAKE_PID" 2>/dev/null || true; rm -rf "$T"; }
 trap cleanup EXIT
 
 export HOME="$T/home" XDG_CONFIG_HOME="$T/home/.config" GIT_CONFIG_NOSYSTEM=1
@@ -1122,11 +1123,28 @@ wtg "$HM" "$H1" finish >"$T/h6.out" 2>&1 & PH=$!
 untilf "$T/h6.out" "머지 순번"
 echo late >"$HM/late6.txt"; commit "$HM" "late6"
 wql "$REL"; rc=0; wait "$PH" || rc=$?
-check "묶음은 머지하되 새 커밋이 생긴 레인은 남기고 1" bash -c "[ $rc = 1 ] && [ -d '$HM' ] && grep -F '묶음에 올린 뒤 이 레인에 새 커밋' '$T/h6.out' >/dev/null"
+check "묶음은 머지하되 새 커밋이 생긴 레인은 남기고 1" bash -c "[ $rc = 1 ] && [ -d '$HM' ] && grep -F '새 커밋·미커밋 변경이 생겨 지우지 않았습니다' '$T/h6.out' >/dev/null"
 check "  └ 검증한 커밋·다른 레인은 main에, 늦은 커밋은 아직" bash -c "git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:h6.txt && git -C '$GR' cat-file -e origin/main:h6o.txt && ! git -C '$GR' cat-file -e origin/main:late6.txt 2>/dev/null"
 rc=0; out=$(wtg "$HM" "$H1" finish 2>&1) || rc=$?
 check "  └ 다시 finish하면 남은 커밋 머지·정리" bash -c "[ $rc = 0 ] && git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:late6.txt && [ ! -e '$HM' ]"
 wtg "$HO" m2 finish >/dev/null 2>&1 || true
+check "  └ 표식 비움" [ "$(rdy)" = 0 ]
+
+scene "⑭-16 기다리던 finish가 다른 곳의 묶음으로 머지돼 정리만 할 때도(qrc=4) 그사이 생긴 미커밋 변경이 있으면 워크트리를 지우지 않음"
+U1=$(gs2 wip1); echo u >"$U1/wip1.txt"; commit "$U1" "wip1"; wtg "$U1" m2 ready >/dev/null 2>&1
+U2=$(gstart wip2); echo u >"$U2/wip2.txt"; commit "$U2" "wip2"; wtg "$U2" "$H1" ready >/dev/null 2>&1
+hold_flush "$T/u.out"   # flush가 차례를 쥐고 검증에서 멈춘 동안
+wtg "$U1" m2 finish >"$T/u1.out" 2>&1 & PU=$!
+untilf "$T/u1.out" "머지 순번"
+echo "중요한 미커밋 작업" >"$U1/wip.txt"; echo changed >>"$U1/a.txt"
+touch "$T/go"; wait "$PH" || true; rc=0; wait "$PU" || rc=$?
+check "다른 곳 묶음으로 머지돼도 미커밋 변경이 있으면 워크트리를 남기고 1" bash -c "[ $rc = 1 ] && [ -f '$U1/wip.txt' ] && grep -Fx changed '$U1/a.txt' >/dev/null"
+check "  └ 안내" has "$(cat "$T/u1.out")" "새 커밋·미커밋 변경이 생겨 지우지 않았습니다"
+check "  └ 레인 내용은 flush가 머지, 머지됨 표식은 남음" bash -c "git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:wip1.txt && printf '%s' \"\$1\" | grep -F 'state=merged' >/dev/null" _ "$(rsubj refs/wt-ready/main/wip1)"
+(cd "$U1" && rm wip.txt && git checkout -q a.txt)
+rc=0; wtg "$U1" m2 finish >/dev/null 2>&1 || rc=$?
+check "  └ 변경을 치운 뒤 finish는 '이미 반영됨'으로 정리" bash -c "[ $rc = 0 ] && [ ! -e '$U1' ]"
+wtg "$U2" "$H1" finish >/dev/null 2>&1 || true
 check "  └ 표식 비움" [ "$(rdy)" = 0 ]
 
 scene "⑭-15 준비됨 표식 임시 ref(refs/wt-ready-seen/<pid>/)"
