@@ -14,7 +14,7 @@ git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 limit=""; command -v timeout >/dev/null 2>&1 && limit="timeout 25"
 cleaned=$($limit "$HOME/.claude/bin/wt" gc --apply 2>&1 | grep '정리 대상' || true)
 # [wt 관리 밖](배포용 사본 등)·[기준 브랜치](v2 같은 장기 브랜치)는 작업 레인이 아니므로 알리지 않는다.
-out=$("$HOME/.claude/bin/wt" list 2>/dev/null | tail -n +2 | grep -v -e '\[wt 관리 밖\]' -e '\[기준 브랜치\]' || true)
+out=$(WT_NO_READY=1 "$HOME/.claude/bin/wt" list 2>/dev/null | tail -n +2 | grep -v -e '\[wt 관리 밖\]' -e '\[기준 브랜치\]' || true)
 [ -n "$out$cleaned" ] || exit 0
 msg=""
 if [ -n "$cleaned" ]; then

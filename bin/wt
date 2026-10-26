@@ -7,6 +7,10 @@
 #   wt train [--title <제목>] [--priority …] [--wait <초>] <레인>...
 #                                        여러 레인을 레인마다 커밋 하나로 쌓아 검증 한 번 → 한 번에 머지 → 정리
 #   wt verify                           (워크트리 안에서) 검증 실행. 통과한 코드면 finish가 같은 검증을 건너뜀
+#   wt ready [--note <글>] | --cancel    (워크트리 안에서) rebase → 검증 → push → origin에 준비됨 표식. 머지는 기다리지 않음
+#   wt flush [--base <브랜치>] [--title <제목>] [--priority …] [--wait <초>]
+#                                        origin의 준비됨 레인 전부(어느 기계 것이든)를 쌓아 검증 한 번 → 한 번에 머지
+#                                        0 머지(또는 없음) | 3 충돌로 뺀 레인 있음·대기 시간 초과 | 1 실패(검증 실패면 아무것도 머지 안 함)
 #   wt list [--conflicts]                워크트리·브랜치 상태(레인마다 자기 기준으로). --conflicts: 레인별 예상 충돌
 #   wt gc [--apply]                      이미 기준에 반영된 워크트리·브랜치 정리(기본은 목록만)
 #   wt overlap                           (워크트리 안에서) 다른 레인·기준과 미리 합쳐 본 충돌 예고
@@ -26,6 +30,8 @@
 # 소유 표식: start·claim이 <워크트리 git-dir>/wt-owner 에 세션 ID·claude pid를 남긴다.
 # 그 pid가 살아 있는 다른 세션이면 finish·gc가 건드리지 않고, list에 [다른 세션 사용 중]으로 보인다.
 # 미반영 커밋을 가진 채 WT_STALE_DAYS(14)일 방치되면 list에 [오래됨]. WT_FORCE_VERIFY=1이면 finish가 늘 검증.
+# 자동 묶음: GitHub 대기열의 finish는 기다리는 동안 레인을 준비됨으로 올려 두고, 차례가 오면 다른 준비됨 레인과 함께 머지한다.
+# git config wt.autobatch false면 끈다. --priority critical은 묶지도 묶이지도 않는다.
 #
 # 위치: <저장소>/../<저장소이름>.wt/<슬러그>
 # 저장소별 선택 파일(커밋해 두면 모든 워크트리에 적용):
@@ -81,6 +87,8 @@ WT_Q_SELF=$$   # 이 프로세스의 pid. 백그라운드 서브셸에서 $$는 
 on_exit() {
   # 리다이렉션을 붙이지 않는다: bash 3.2는 원래 fd를 10 이상에 복사해 두는데 그 사이 띄운 정리 프로세스(q_reap_bg)가 사본을 물려받아
   # $(wt queue enter …)로 부른 쪽의 파이프를 최대 30분 붙든다. 경고는 보이고 git 잡음은 q_drop이 버린다.
+  # 실패·시간 초과로 끝나는 finish가 올린 준비됨 표식은 지운다(고치는 사이 다른 곳이 옛 내용을 머지하지 않게).
+  [ -z "${WT_READY_REF-}" ] || r_clear "$WT_READY_REF" || true
   q_leave || true
   [ -z "$WT_Q_USED" ] || git for-each-ref --format='delete %(refname)' "refs/wt-queue-seen/$$/" 2>/dev/null | git update-ref --stdin 2>/dev/null || true
   [ -z "$WT_TMP_WT" ] || git -C "$WT_ROOT" worktree remove --force "$WT_TMP_WT" 2>/dev/null || true
@@ -564,6 +572,8 @@ q_wait() {
       fi
       continue   # 그사이 다른 번호표가 차례를 쥐었다
     fi
+    # 자동 묶음 finish: 기다리는 동안 차례를 쥔 쪽이 이 레인까지 함께 머지했으면 4
+    if [ -n "$WT_Q_HOOK" ] && "$WT_Q_HOOK"; then return 4; fi
     now=$(date +%s)
     [ "$now" -lt "$end" ] || return 3
     if [ "$now" -ge "$next" ]; then
@@ -641,6 +651,7 @@ queue_turn() { # <기준> <kind> <priority> <lane> <기다릴 초> [<메모>]
   local rc=0; q_wait "$(q_base "$1")" "${WT_Q_REF##*/}" "$5" || rc=$?
   case $rc in
     0) say "머지 차례를 받았습니다(${WT_Q_REF#refs/wt-queue/})" ;;
+    4) return 4 ;;   # WT_Q_HOOK: 다른 곳이 함께 머지함
     3) say "머지 순번을 $(($5 / 60))분 기다렸지만 차례가 오지 않았습니다. wt queue 로 앞 작업을 확인한 뒤 다시 실행하세요. 워크트리는 남겨 둠"; exit 3 ;;
     *) die "머지 대기열을 쓰지 못했습니다(origin 네트워크·권한). 워크트리는 남겨 둠" ;;
   esac
@@ -662,6 +673,259 @@ q_old_claim_wait() { # <refs/wt-queue/<기준>>
     [ -n "$said" ] || { say "옛 판 wt의 머지 선점 $name 이 살아 있어 풀릴 때까지 기다립니다: ${C_BODY:-조회 실패}"; said=1; }
     sleep "${WT_QUEUE_POLL:-5}"
   done
+}
+
+# ── 준비됨 표식(origin의 refs/wt-ready/<기준>/<슬러그>) ─────────────
+# wt ready가 레인을 "검증 끝, 머지만 남음"으로 올려 두면 차례를 쥔 쪽(wt flush, 자동 묶음 wt finish)이 어느 기계 것이든
+# 함께 쌓아 검증 한 번으로 머지한다. 표식 = 레인 커밋을 부모로, 같은 트리를 가진 빈 커밋. 제목 한 줄
+# "wt-ready branch=… base=… host=… session=… pid=… at=… tree=<검증한 트리> state=ready|conflict|failed [against=<기준 sha>] note=…".
+# 표식 하나만 받으면 부모(레인 커밋)까지 오므로 다른 기계의 브랜치를 따로 받지 않는다. 만들기·바꾸기·지우기는 모두 지금 sha에 건 lease.
+# 머지한 쪽이 표식과 원격 레인 브랜치를 지우고, 충돌로 뺐거나 묶음 검증이 실패하면 state와 against(그때 기준)를 남긴다.
+WT_READY_REF="" WT_READY_SHA="" WT_READY_BASE="" WT_Q_HOOK="" B_NAMES=""
+r_ref() { local s=${2#wt/}; echo "refs/wt-ready/$(q_base "$1")/${s//\//_}"; }   # <기준> <브랜치>
+r_f() { q_field "$1" "${2%% note=*}"; }   # note= 뒤 글은 보지 않는다
+# r_remote <ref>: origin의 지금 sha(없으면 빈 값). 조회 실패 1.
+r_remote() { local out; out=$(git ls-remote origin "$1") || return 1; printf '%s\n' "$out" | awk -v r="$1" '$2==r{print $1}'; }
+r_commit() { GIT_AUTHOR_NAME=wt GIT_AUTHOR_EMAIL=wt GIT_COMMITTER_NAME=wt GIT_COMMITTER_EMAIL=wt git commit-tree "$1^{tree}" -p "$1" -m "$2"; }
+# r_post <기준> <브랜치> <레인 커밋> <메모>: 표식을 만들거나 새로 올린다(이전 상태는 덮는다). WT_READY_REF·WT_READY_SHA에 남긴다.
+r_post() {
+  local ref sha cur s; ref=$(r_ref "$1" "$2"); s=$(my_session)
+  sha=$(r_commit "$3" "wt-ready branch=$2 base=$1 host=$(claim_host) session=${s:--} pid=${WT_CLAUDE_PID:-$(claude_pid)} at=$(date -u +%Y-%m-%dT%H:%M:%SZ) tree=$(git rev-parse "$3^{tree}") state=ready note=${4//[$'\n\t']/ }") || return 1
+  cur=$(r_remote "$ref") || return 1
+  git push --quiet --force-with-lease="$ref:$cur" origin "$sha:$ref" >/dev/null 2>&1 || return 1
+  WT_READY_REF=$ref WT_READY_SHA=$sha
+}
+# r_clear <ref>: 지금 표식을 상태와 관계없이 지운다(없으면 0).
+r_clear() {
+  local cur; cur=$(r_remote "$1") || return 1
+  [ -z "$cur" ] || git push --quiet --force-with-lease="$1:$cur" origin ":$1" >/dev/null 2>&1
+}
+# r_mark <ref> <표식 sha> <state> <기준 sha>: 표식이 아직 그 sha일 때만 상태를 바꾼다(주인이 그사이 다시 올렸으면 그대로).
+r_mark() {
+  local s new; s=$(git log -1 --format=%s "$2")
+  new=$(r_commit "$(git rev-parse "$2^")" "${s%% state=*} state=$3 against=$4 note=${s#* note=}") || return 1
+  git push --quiet --force-with-lease="$1:$2" origin "$new:$1" >/dev/null 2>&1
+}
+# r_scan <기준(q_base) 또는 *>: 표식을 받아 만든 순으로 "<기준>/<슬러그>\t<표식 sha>\t<레인 커밋>\t<시각>\t<제목>". 읽지 못하면 1.
+r_scan() {
+  local ns="refs/wt-ready-seen/$$" spec out
+  if [ "$1" = '*' ]; then spec="+refs/wt-ready/*:$ns/*"; else spec="+refs/wt-ready/$1/*:$ns/$1/*"; fi
+  git fetch --quiet --no-tags origin "$spec" 2>/dev/null || return 1
+  out=$(git for-each-ref --sort=committerdate --format='%(refname:lstrip=3)%09%(objectname)%09%(parent)%09%(committerdate:unix)%09%(contents:subject)' "$ns/")
+  git for-each-ref --format='delete %(refname)' "$ns/" | git update-ref --stdin
+  [ -z "$out" ] || printf '%s\n' "$out"
+}
+# r_show <기준(q_base) 또는 *>: 준비됨 레인 줄(목록용). 없으면 빈 출력, 읽지 못하면 1.
+r_show() {
+  local rows sl sha tip ct subj a m now; now=$(date +%s)
+  rows=$(r_scan "$1") || return 1
+  [ -n "$rows" ] || return 0
+  while IFS=$'\t' read -r sl sha tip ct subj; do
+    a=$(r_f against "$subj"); m=""
+    case $(r_f state "$subj") in
+      conflict) m=" [충돌로 빠짐, 기준 ${a:0:9} — 주인이 wt finish]" ;;
+      failed) m=" [묶음 검증 실패, 기준 ${a:0:9} — 주인이 wt finish]" ;;
+    esac
+    printf '  %s  %s  %s분 전%s  %s\n' "$sl" "$(r_f host "$subj")" $(((now - ct) / 60)) "$m" "${subj#* note=}"
+  done <<<"$rows"
+}
+# 자동 묶음 finish가 차례를 기다리는 동안(q_wait의 WT_Q_HOOK): 내 표식이 사라졌고 내용이 기준에 있으면 0(다른 곳이 함께 머지함).
+# 표식이 바뀌었으면(차례를 쥔 쪽이 충돌·검증 실패로 뺌) 알리고 계속 기다린다 — 내 차례에 직접 올려 검증한다.
+r_merged() {
+  local cur; cur=$(r_remote "$WT_READY_REF") || return 1
+  if [ -n "$cur" ]; then
+    [ "$cur" = "$WT_READY_SHA" ] && return 1
+    WT_READY_SHA=$cur; say "다른 곳의 묶음에서 빠졌습니다(충돌 또는 묶음 검증 실패). 차례가 오면 이 레인만 직접 올려 검증합니다"
+    return 1
+  fi
+  git fetch --quiet origin "$WT_READY_BASE" 2>/dev/null && content_in_base "origin/$WT_READY_BASE" HEAD
+}
+
+# stack_one <커밋> <이름> <기준 ref> [<제목>]: 통합 워크트리(WT_TMP_WT)에 그 커밋을 squash 커밋 하나로 얹는다.
+# 0 쌓음, 1 충돌(되돌림), 2 이미 기준에 있음. 충돌 밖의 실패는 die.
+stack_one() {
+  local rc=0 out
+  out=$(git -C "$WT_TMP_WT" -c merge.ff=true -c rerere.enabled=false merge --squash "$1" 2>&1) || rc=$?
+  if [ $rc != 0 ]; then
+    [ -n "$(git -C "$WT_TMP_WT" diff --name-only --diff-filter=U)" ] || die "$2 를 쌓지 못했습니다. 아무것도 머지하지 않았습니다: $out"
+    git -C "$WT_TMP_WT" reset --quiet --hard
+    return 1
+  fi
+  git -C "$WT_TMP_WT" diff --cached --quiet && return 2
+  git -C "$WT_TMP_WT" commit --quiet -F - <<<"$(squash_message "$3" "${4-}" "$1")" || die "$2 의 커밋을 만들지 못했습니다"
+}
+tmp_drop() { teardown_worktree "$WT_TMP_WT"; git worktree remove --force "$WT_TMP_WT"; WT_TMP_WT=""; }
+
+# batch_run <기준> <제목> [<내 브랜치> <내 커밋>]: 묶음 머지(wt flush, 자동 묶음 finish). 차례(GitHub 대기열) 또는 잠금을 쥔 뒤 부른다.
+# 최신 origin/<기준>의 통합 워크트리에 (내 레인 →) state=ready 표식을 만든 순으로 squash 커밋 하나씩 쌓고(충돌 나는 레인은 빼고 계속),
+# 검증을 한 번 돌려(쌓은 트리가 누군가 검증한 트리와 같으면 건너뜀) 한 번에 머지한다(대기열이면 PR rebase 머지, 아니면 기준으로 push —
+# 기준이 움직였으면 거절된다). 기준이 움직였으면 다시 쌓는다(5번까지). 머지한 표식·원격 레인 브랜치(머지한 커밋 그대로일 때)는
+# 지우고, 뺀 표식은 state=conflict로 남긴다. 다른 기계의 워크트리는 건드리지 않는다. B_NAMES에 머지한 레인 이름.
+# 종료 코드: 0 머지, 3 머지했고 충돌로 뺀 레인 있음, 10 쌓을 다른 레인 없음, 11 내 레인을 쌓지 못함(새 기준과 충돌),
+# 12 검증 실패(아무것도 머지 안 함, 쌓은 다른 표식은 state=failed). 그 밖의 실패는 die.
+batch_run() {
+  local base=$1 title=$2 mine=${3-} mytip=${4-} up="origin/$1" qb root try=0 rows sl sha tip ct subj rc i n
+  local refs=() shas=() tips=() names=() vts stacked already conflicted tree head upsha tb pr state body cur
+  qb=$(q_base "$base"); root=$(main_root)
+  while :; do
+    try=$((try + 1))
+    git fetch --quiet origin "$base" || die "origin/$base 를 받지 못했습니다(네트워크)"
+    rows=$(r_scan "$qb") || die "origin에서 준비됨 표식을 읽지 못했습니다(네트워크)"
+    n=0 vts=""
+    while IFS=$'\t' read -r sl sha tip ct subj; do
+      [ -n "$sl" ] && [ "$(r_f state "$subj")" = ready ] || continue
+      [ "$(r_f branch "$subj")" != "$mine" ] || continue
+      refs[n]="refs/wt-ready/$sl" shas[n]=$sha tips[n]=$tip names[n]=$(r_f branch "$subj"); vts+=" $(r_f tree "$subj")"; n=$((n + 1))
+    done <<<"$rows"
+    [ $n -gt 0 ] || return 10
+    upsha=$(git rev-parse "$up")
+    WT_ROOT=$root WT_TMP_WT="$(dirname "$root")/$(basename "$root").wt/.train-$$"
+    git worktree add --quiet --detach "$WT_TMP_WT" "$up"
+    stacked="" already="" conflicted="" B_NAMES=""
+    if [ -n "$mine" ]; then
+      rc=0; stack_one "$mytip" "$mine" "$up" "$title" || rc=$?
+      [ $rc = 0 ] || { tmp_drop; return 11; }
+      B_NAMES=" ${mine#wt/}"; vts+=" $(git rev-parse "$mytip^{tree}")"
+    fi
+    for ((i = 0; i < n; i++)); do
+      rc=0; stack_one "${tips[i]}" "${names[i]}" "$up" || rc=$?
+      case $rc in
+        0) stacked+=" $i"; B_NAMES+=" ${names[i]#wt/}"; say "쌓음: ${names[i]}" ;;
+        1) conflicted+=" $i"; say "충돌로 뺌: ${names[i]}" ;;
+        *) already+=" $i"; say "이미 ${base}에 들어 있음: ${names[i]}" ;;
+      esac
+    done
+    head=$(git -C "$WT_TMP_WT" rev-parse HEAD)
+    if [ "$head" != "$upsha" ]; then
+      # 준비 스크립트는 쌓은 뒤에(의존성을 바꾼 레인도 그 의존성으로 검증되게).
+      prepare_worktree "$root" "$WT_TMP_WT" || die "준비 스크립트 실패(통합 워크트리). 아무것도 머지하지 않았습니다"
+      tree=$(git -C "$WT_TMP_WT" rev-parse 'HEAD^{tree}')
+      if [ -x "$WT_TMP_WT/.claude/wt-verify.sh" ]; then
+        if [ "${WT_FORCE_VERIFY:-}" != 1 ] && case " $vts " in *" $tree "*) true ;; *) false ;; esac; then
+          say "쌓은 결과가 이미 검증한 트리와 같아 검증을 건너뜁니다(트리 ${tree:0:7}, 다시 돌리려면 WT_FORCE_VERIFY=1)"
+        elif ! (cd "$WT_TMP_WT" && run_verify); then
+          for i in $stacked; do r_mark "${refs[i]}" "${shas[i]}" failed "$upsha" || true; done
+          tmp_drop; return 12
+        fi
+      fi
+      if [ -n "$WT_Q_REF" ]; then
+        git fetch --quiet origin "$base" || die "origin/$base 를 받지 못했습니다(네트워크)"
+        if ! git merge-base --is-ancestor "$up" "$head"; then
+          tmp_drop; [ $try -lt 5 ] || die "${base}가 계속 움직여 머지하지 못했습니다. 잠시 뒤 다시 실행하세요"
+          say "검증하는 사이 ${up}이 움직였습니다. 다시 쌓아 검증합니다($((try + 1))/5)"; continue
+        fi
+        q_holding || die "머지 차례를 잃었습니다(오래 걸려 다른 곳이 낡은 번호표로 넘겨받음). 아무것도 머지하지 않았습니다. 다시 실행하세요"
+        tb="wt/batch-$(date +%Y%m%d-%H%M%S)-$$"
+        body=$(git -C "$WT_TMP_WT" log --reverse --format='* %s' "$up..HEAD")
+        say "push → origin/$tb"
+        git push --quiet --force-with-lease="refs/heads/$tb:" origin "$head:refs/heads/$tb" \
+          || die "origin/$tb push 실패(같은 이름이 이미 있거나 네트워크). 아무것도 머지하지 않았습니다"
+        pr=$(gh pr create --base "$base" --head "$tb" --title "${title:-"batch:$B_NAMES"}" \
+          --body "$(printf '%s\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' "$body")") && pr=${pr##*/} \
+          && [[ $pr =~ ^[0-9]+$ ]] \
+          || { git push --quiet --force-with-lease="refs/heads/$tb:$head" origin --delete "$tb" 2>/dev/null || true; die "PR을 만들지 못했습니다(번호 확인 실패: ${pr-}). 아무것도 머지하지 않았습니다"; }
+        say "PR #$pr rebase 머지(레인마다 커밋 하나)"
+        if ! gh pr merge "$pr" --rebase --match-head-commit "$head"; then
+          gh pr close "$pr" --delete-branch >/dev/null 2>&1 || true
+          die "머지 실패(rebase 머지 허용 여부·보호 규칙·체크 등). PR #$pr 은 닫았습니다. 아무것도 머지하지 않았습니다"
+        fi
+        state=$(gh pr view "$pr" --json state --jq .state)
+        [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다"
+        git push --quiet --force-with-lease="refs/heads/$tb:$head" origin --delete "$tb" 2>/dev/null || true
+      else
+        # 대기열 없는 원격: 그사이 기준이 움직였으면 빨리 감기가 아니라 거절된다 → 다시 쌓는다.
+        if ! git push --quiet origin "$head:refs/heads/$base"; then
+          tmp_drop; [ $try -lt 5 ] || die "origin/$base 로 push하지 못했습니다(기준이 계속 움직이거나 네트워크). 아무것도 머지하지 않았습니다"
+          say "${up}이 움직였습니다. 다시 쌓아 검증합니다($((try + 1))/5)"; continue
+        fi
+        ff_base "$head" "$base"
+      fi
+    fi
+    for i in $stacked $already; do
+      r_mark_gone "${refs[i]}" "${shas[i]}"
+      cur=$(r_remote "refs/heads/${names[i]}") || cur=""
+      [ "$cur" != "${tips[i]}" ] || git push --quiet --force-with-lease="refs/heads/${names[i]}:$cur" origin --delete "${names[i]}" >/dev/null 2>&1 || true
+    done
+    for i in $conflicted; do r_mark "${refs[i]}" "${shas[i]}" conflict "$upsha" || true; done
+    tmp_drop
+    [ -z "$conflicted" ] || return 3
+    return 0
+  done
+}
+# 머지한 표식을 지운다(그 sha일 때만 — 주인이 그사이 새 커밋으로 다시 올렸으면 남긴다).
+r_mark_gone() { git push --quiet --force-with-lease="$1:$2" origin ":$1" >/dev/null 2>&1 || true; }
+
+cmd_ready() {
+  local cancel=0 note=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --cancel) cancel=1; shift ;;
+      --note) note=${2-}; shift 2 ;;
+      *) die "사용법: wt ready [--note <글>] | wt ready --cancel" ;;
+    esac
+  done
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  in_linked_worktree || die "작업 워크트리 안에서 실행하세요"
+  has_origin || die "origin 원격이 없어 준비됨 표식을 둘 수 없습니다(혼자 쓰는 저장소는 wt finish·wt train)"
+  local dir branch base upstream st
+  dir=$(git rev-parse --show-toplevel); cd "$dir"
+  branch=$(git symbolic-ref --quiet --short HEAD) || die "브랜치가 없는 상태(detached)입니다"
+  base=$(lane_base "$branch")
+  if [ $cancel = 1 ]; then
+    r_clear "$(r_ref "$base" "$branch")" || die "origin의 준비됨 표식을 지우지 못했습니다(네트워크)"
+    say "준비됨 표식을 지웠습니다: $branch"; return
+  fi
+  [ -z "$(git status --porcelain)" ] || die "커밋하지 않은 변경이 있습니다. 먼저 커밋하세요"
+  [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ] \
+    && die "rebase가 진행 중입니다. 충돌을 풀고 git rebase --continue 후 다시 실행하세요"
+  st=$(owner_state "$dir")
+  case $st in other*) [ "${WT_FORCE_FINISH:-}" = 1 ] || die "다른 세션이 쓰는 워크트리입니다$(owner_label "$st")" ;; esac
+  git fetch --quiet origin "$base" || die "origin/$base 를 받지 못했습니다(네트워크)"
+  upstream="origin/$base"
+  [ "$(git rev-list --count "$upstream..HEAD")" != 0 ] || die "${base}에 새로 들어갈 커밋이 없습니다(정리는 wt finish)"
+  content_in_base "$upstream" HEAD && die "이미 ${base}에 반영된 레인입니다(정리는 wt finish)"
+  onto_upstream "$upstream" "$dir" "$branch"
+  verify_if_changed
+  push_lane "$branch"
+  r_post "$base" "$branch" HEAD "$note" || die "origin에 준비됨 표식을 올리지 못했습니다(네트워크·권한)"
+  WT_READY_REF=""   # 성공한 표식은 남긴다(on_exit가 지우지 않게)
+  say "준비됨: $(r_ref "$base" "$branch") (트리 $(git rev-parse --short 'HEAD^{tree}')). 차례를 쥔 wt finish·wt flush가 함께 머지합니다. 머지되면 이 워크트리는 wt finish·wt gc로 정리"
+}
+
+cmd_flush() {
+  local base="" title="" prio=normal wait=3600
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --base) base=${2-}; shift 2 ;;
+      --title) title=${2-}; shift 2 ;;
+      --priority) prio=${2-}; q_prio_ok "$prio"; shift 2 ;;
+      --wait) [[ ${2-} =~ ^[0-9]+$ ]] || die "--wait 에는 숫자를 주세요: ${2-}"; wait=$2; shift 2 ;;
+      *) die "사용법: wt flush [--base <브랜치>] [--title <제목>] [--priority …] [--wait <초>]" ;;
+    esac
+  done
+  git rev-parse --git-dir >/dev/null 2>&1 || die "git 저장소가 아닙니다"
+  has_origin || die "origin 원격이 없습니다(준비됨 표식은 origin에 둡니다). 혼자 쓰는 저장소는 wt train"
+  local root rows; root=$(main_root); cd "$root"
+  [ -n "$base" ] || base=$(default_branch)
+  rows=$(r_scan "$(q_base "$base")") || die "origin에서 준비됨 표식을 읽지 못했습니다(네트워크)"
+  printf '%s\n' "$rows" | grep -F ' state=ready ' >/dev/null || { say "${base}에 준비된 레인이 없습니다"; return 0; }
+  if is_github && type -P gh >/dev/null; then
+    queue_turn "$base" train "$prio" "" "$wait" flush
+    q_old_claim_wait "${WT_Q_REF%/*}"   # 옛 판 호환, 다음 판에서 제거
+  else
+    take_lock
+  fi
+  local rc=0; batch_run "$base" "$title" || rc=$?
+  case $rc in
+    0|3) ;;
+    10) say "${base}에 준비된 레인이 없습니다(다른 곳이 먼저 머지함)"; return 0 ;;
+    12) die "묶음 검증 실패. 아무것도 머지하지 않았습니다. 쌓은 레인의 표식에 실패를 남겼습니다(주인이 그 워크트리에서 wt finish로 각자 검증·머지)" ;;
+    *) die "묶음 머지 실패(종료 코드 $rc)" ;;
+  esac
+  q_leave
+  sync_main "$root" "$base"
+  say "머지 완료 → $base:${B_NAMES:- 없음}. 레인 워크트리는 각 기계의 wt finish·wt gc가 정리합니다"
+  [ $rc = 0 ] || { say "충돌로 뺀 레인은 표식에 남겼습니다(wt queue 로 확인, 주인이 그 워크트리에서 wt finish)"; exit 3; }
 }
 
 cmd_queue() {
@@ -707,8 +971,8 @@ cmd_queue() {
   t=$(q_scan "$qb" "") || die "origin에서 대기열을 읽지 못했습니다"
   read -r hid _ hct <<<"${t%%$'\n'*}"; rows=$(printf '%s\n' "$t" | sed 1d)
   echo "머지 대기열 $base:"
-  [ -n "$rows" ] || { echo "  비어 있음"; return; }
-  while IFS=$'\t' read -r id ct subj; do
+  [ -n "$rows" ] || echo "  비어 있음"
+  [ -z "$rows" ] || while IFS=$'\t' read -r id ct subj; do
     i=$((i + 1)); mark=""
     if [ "$id" = "$hid" ]; then
       mark=" [차례]"; [ $((now - hct)) -le 3600 ] || mark=" [차례 $(((now - hct) / 60))분째 쥠 — 오래 쥔 차례]"
@@ -719,6 +983,9 @@ cmd_queue() {
     printf '  %d. %s  %s  %s %s (%s분째)%s  %s  %s\n' $i "$(q_field priority "$subj")" "$(q_field host "$subj")" "$(q_field kind "$subj")" \
       "$lane2" $(((now - born) / 60)) "$mark" "refs/wt-queue/$qb/$id" "${subj#*note=}"
   done <<<"$rows"
+  echo "준비됨 $base (wt flush·자동 묶음 finish가 함께 머지):"
+  t=$(r_show "$qb") || t="  (origin에서 준비됨 표식을 읽지 못했습니다)"
+  printf '%s\n' "${t:-  없음}"
 }
 
 # 새 워크트리 준비: .worktreeinclude의 gitignore 파일 사본 + .claude/wt-setup.sh. start와 train(통합 워크트리)이 쓴다.
@@ -959,15 +1226,44 @@ cmd_finish() {
 
   if [ "$(git rev-list --count "$upstream..HEAD")" = 0 ]; then
     say "${base}에 새로 들어갈 커밋이 없습니다. 정리만 합니다"
+  elif content_in_base "$upstream" HEAD; then
+    say "이미 ${base}에 반영된 레인입니다(다른 곳의 묶음 머지 등). 정리만 합니다"
   else
     onto_upstream "$upstream" "$dir" "$branch"
     verify_if_changed
 
     if [ $queue = 1 ]; then
+      # 자동 묶음(git config wt.autobatch, 기본 켬, critical은 제외): 줄에 서기 전에 레인을 준비됨으로 올려 둔다 — 앞에서 차례를
+      # 쥔 finish·flush가 이 레인까지 함께 머지하면 기다리다 알아차리고(q_wait의 WT_Q_HOOK) 정리만 한다. 내 차례가 오면 다른
+      # 준비됨 레인을 내 레인과 함께 쌓아 검증 한 번으로 머지한다(batch_run). 묶을 레인이 없거나 묶음이 안 되면 이 레인만.
+      local batch=0 qrc=0 brc=10 single=1
+      if [ "$prio" != critical ] && [ "$(git config --bool wt.autobatch 2>/dev/null || true)" != false ]; then
+        push_lane "$branch"
+        if r_post "$base" "$branch" HEAD ""; then batch=1 WT_READY_BASE=$base WT_Q_HOOK=r_merged
+        else say "경고: origin에 준비됨 표식을 올리지 못해 다른 레인과 묶지 않습니다"; fi
+      fi
+      queue_turn "$base" merge "$prio" "$branch" "$wait" || qrc=$?
+      WT_Q_HOOK=""
+      if [ $qrc = 0 ]; then
+        q_old_claim_wait "${WT_Q_REF%/*}"   # 옛 판 호환, 다음 판에서 제거. 기다린 뒤 아래에서 기준을 다시 받는다
+        git fetch --quiet origin "$base" || die "origin/$base 를 받지 못했습니다(네트워크). 워크트리는 남겨 둠"
+        ! content_in_base "$upstream" HEAD || qrc=4
+      fi
+      if [ $qrc = 4 ]; then
+        say "다른 곳의 묶음 머지에 함께 들어갔습니다($upstream). 정리만 합니다"; single=0
+      elif [ $batch = 1 ]; then
+        brc=0; batch_run "$base" "$title" "$branch" "$(git rev-parse HEAD)" || brc=$?
+        case $brc in
+          0|3) single=0; say "묶음 머지 →$B_NAMES"
+               [ $brc = 0 ] || say "충돌로 뺀 레인은 표식에 남겼습니다(wt queue 로 확인, 주인이 그 워크트리에서 wt finish)" ;;
+          11) say "새 기준 위에 이 레인을 쌓지 못해 묶지 않고 이 레인만 올립니다" ;;
+          12) say "묶음 검증이 실패했습니다(함께 쌓은 레인 표식에 기록). 이 레인만 머지합니다" ;;
+        esac
+      fi
+    fi
+    if [ $queue = 1 ] && [ $single = 1 ]; then
       # 차례를 받은 뒤 origin/<기준>을 다시 받아 검증한 기준 그대로인지 본다. 움직였으면 차례를 쥔 채 다시 올려 검증한다 —
       # 검증하지 않은 조합을 머지하지 않게. 대기열 밖에서 계속 push하는 곳이 있으면 5번 뒤 멈춘다.
-      queue_turn "$base" merge "$prio" "$branch" "$wait"
-      q_old_claim_wait "${WT_Q_REF%/*}"   # 옛 판 호환, 다음 판에서 제거. 기다린 뒤 아래에서 기준을 다시 받는다
       local try=1
       while :; do
         git fetch --quiet origin "$base" || die "origin/$base 를 받지 못했습니다(네트워크). 워크트리는 남겨 둠"
@@ -998,6 +1294,8 @@ cmd_finish() {
         || die "머지 실패(보호 규칙·체크 등). PR #$pr 을 확인하세요. 워크트리는 남겨 둠"
       state=$(gh pr view "$pr" --json state --jq .state)
       [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다. 워크트리는 남겨 둠"
+    fi
+    if [ $queue = 1 ]; then
       q_leave
       git push --quiet --force-with-lease="refs/heads/$branch:$(git rev-parse HEAD)" origin --delete "$branch" 2>/dev/null || true
     else
@@ -1012,6 +1310,9 @@ cmd_finish() {
     fi
     say "머지 완료 → $base"
   fi
+  # 이 레인의 준비됨 표식(이번 finish가 올린 것, 앞서 wt ready로 올린 것, 다른 곳이 충돌로 표시한 것)을 지운다.
+  if has_origin; then r_clear "$(r_ref "$base" "$branch")" || say "경고: origin의 준비됨 표식을 지우지 못했습니다(나중에 wt queue로 확인)"; fi
+  WT_READY_REF=""
 
   cd "$root"
   remove_lane "$dir" "$branch"
@@ -1076,17 +1377,12 @@ cmd_train() {
   for i in "${!branches[@]}"; do
     b=${branches[$i]}
     tips[$i]=$(git rev-parse --verify --quiet "refs/heads/$b") || { say "그사이 사라진 레인: $b"; continue; }
-    rc=0; out=$(git -C "$WT_TMP_WT" -c merge.ff=true -c rerere.enabled=false merge --squash "${tips[$i]}" 2>&1) || rc=$?
-    if [ $rc != 0 ]; then
-      [ -n "$(git -C "$WT_TMP_WT" diff --name-only --diff-filter=U)" ] || die "$b 를 쌓지 못했습니다. 아무것도 머지하지 않았습니다: $out"
-      git -C "$WT_TMP_WT" reset --quiet --hard
-      conflicted+=" $i"; say "충돌로 뺌: $b"; continue
-    fi
-    if git -C "$WT_TMP_WT" diff --cached --quiet; then
-      already+=" $i"; say "이미 ${base}에 들어 있음: $b"; continue
-    fi
-    git -C "$WT_TMP_WT" commit --quiet -F - <<<"$(squash_message "$upstream" "" "${tips[$i]}")"
-    stacked+=" $i"; say "쌓음: $b"
+    rc=0; stack_one "${tips[$i]}" "$b" "$upstream" || rc=$?
+    case $rc in
+      0) stacked+=" $i"; say "쌓음: $b" ;;
+      1) conflicted+=" $i"; say "충돌로 뺌: $b" ;;
+      *) already+=" $i"; say "이미 ${base}에 들어 있음: $b" ;;
+    esac
   done
 
   local names=""
@@ -1139,7 +1435,7 @@ cmd_train() {
     say "머지 완료 → $base:$names"
   fi
 
-  teardown_worktree "$WT_TMP_WT"; git worktree remove --force "$WT_TMP_WT"; WT_TMP_WT=""
+  tmp_drop
   has_origin && { git fetch --quiet origin "$base" || say "경고: origin/$base 를 다시 받지 못해 원격 레인 브랜치 정리를 건너뛸 수 있습니다"; }
   local changed=""
   for i in $stacked $already; do
@@ -1199,6 +1495,11 @@ cmd_list() {
     git worktree list --porcelain | grep -x "branch refs/heads/$b" >/dev/null && continue
     printf '  브랜치만 %s  %s\n' "$b" "$(branch_status "$b")"
   done
+  # origin의 준비됨 레인(모든 기계·기준). 있을 때만 보인다. WT_NO_READY=1이면 읽지 않는다(세션 시작 훅).
+  local rd=""
+  if [ -z "${WT_NO_READY-}" ] && has_origin && rd=$(r_show '*') && [ -n "$rd" ]; then
+    echo "준비됨(origin, 모든 기계 — wt flush·자동 묶음 finish가 함께 머지):"; printf '%s\n' "$rd"
+  fi
   [ "${1-}" = --conflicts ] || return 0
   merge_tree_ok || die "--conflicts는 git 2.38 이상이 필요합니다(git merge-tree --write-tree)"
   echo "예상 충돌(같은 기준 레인끼리·기준과 미리 합쳐 봄):"
@@ -1270,5 +1571,7 @@ case ${1-} in
   claims) shift; cmd_claims "$@" ;;
   queue) shift; cmd_queue "$@" ;;
   verify) shift; cmd_verify "$@" ;;
+  ready) shift; cmd_ready "$@" ;;
+  flush) shift; cmd_flush "$@" ;;
   *) awk 'NR>1 && /^set -e/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 1 ;;
 esac

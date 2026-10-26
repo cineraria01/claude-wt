@@ -843,6 +843,159 @@ SUP="$T/super"; git init -q -b main "$T/subsrc"; git -C "$T/subsrc" commit -q --
 git init -q -b main "$SUP"; (cd "$SUP" && git -c protocol.file.allow=always submodule add -q "$T/subsrc" sm >/dev/null 2>&1 && git commit -qm sm)
 check "하위 모듈 git 폴더(core.worktree) GIT_DIR이면 그 작업 폴더로" [ "$(wtcwd "$T" GIT_DIR="$SUP/.git/modules/sm")" = "$SUP/sm" ]
 
+scene "⑭ 준비됨(wt ready) + 묶음 머지(wt flush): 두 기계 흉내, 검증 한 번으로 둘 다 머지"
+GR2="$T/ghrepo2"; git clone -q "$G" "$GR2" 2>/dev/null; git -C "$GR2" remote set-head origin main
+H1=$(hostname -s)
+# wtg <폴더> <host> <wt 인자…>: GitHub 흉내(gh 스텁)로 그 폴더에서 그 host인 척 wt 실행
+wtg() { local d=$1 h=$2; shift 2; (cd "$d" && WT_HOST=$h PATH="$T/bin:$PATH" exec "$WT" "$@"); }
+gs2() { wtg "$GR2" m2 start "$1" 2>/dev/null | tail -n 1; }
+rdy() { git ls-remote "$G" 'refs/wt-ready/*' | wc -l | tr -d ' '; }
+rsubj() { git -C "$GR" fetch -q origin "+$1:refs/tmp-rs" && git -C "$GR" log -1 --format=%s refs/tmp-rs && git -C "$GR" update-ref -d refs/tmp-rs; }
+mainhas() { git -C "$GR" fetch -q origin && for f; do git -C "$GR" cat-file -e "origin/main:$f" || return 1; done; }
+mainlacks() { git -C "$GR" fetch -q origin && ! git -C "$GR" cat-file -e "origin/main:$1" 2>/dev/null; }
+git -C "$GR" fetch -q origin; GB=$(git -C "$GR" rev-parse origin/main)
+P1=$(gstart p1); echo p1 >"$P1/p1.txt"; commit "$P1" "p1 추가"
+P2=$(gs2 p2); echo p2 >"$P2/p2.txt"; commit "$P2" "p2 추가"
+echo dirty >"$P1/dirty.txt"
+check "미커밋이면 ready 거절" bash -c "! (cd '$P1' && PATH='$T/bin:$PATH' '$WT' ready) 2>/dev/null"
+rm "$P1/dirty.txt"
+runs=$(verify_runs)
+rc=0; out=$(wtg "$P1" "$H1" ready --note "급하지 않음" 2>&1) || rc=$?
+check "ready 성공 + 검증 1회" bash -c "[ $rc = 0 ] && [ $(verify_runs) = $((runs + 1)) ]"
+check "  └ 원격 레인 브랜치도 올림" [ -n "$(git ls-remote "$G" refs/heads/wt/p1)" ]
+wtg "$P2" m2 ready >/dev/null 2>&1
+check "두 기계의 표식 둘" [ "$(rdy)" = 2 ]
+check "표식의 부모가 레인 커밋" [ "$(git -C "$GR" fetch -q origin refs/wt-ready/main/p1 && git -C "$GR" rev-parse FETCH_HEAD^)" = "$(git -C "$P1" rev-parse HEAD)" ]
+check "표식 제목(branch·host·state·note)" bash -c 'printf "%s" "$1" | grep -E "^wt-ready branch=wt/p2 base=main host=m2 .* state=ready note=$" >/dev/null' _ "$(rsubj refs/wt-ready/main/p2)"
+out=$(wq 2>&1)
+check "wt queue에 준비됨 둘(슬러그·host·나이·메모)" bash -c "printf '%s\n' \"\$1\" | grep -Fx '  main/p1  $H1  0분 전  급하지 않음' >/dev/null && printf '%s\n' \"\$1\" | grep -F '  main/p2  m2  0분 전' >/dev/null" _ "$out"
+check "wt list에 준비됨(origin)" has "$(cd "$GR" && "$WT" list 2>&1)" "  main/p2  m2  0분 전"
+check "WT_NO_READY=1이면 list가 읽지 않음" hasnt "$(cd "$GR" && WT_NO_READY=1 "$WT" list 2>&1)" "main/p2"
+runs=$(verify_runs); : >"$GS/calls"
+rc=0; out=$(wtg "$GR" "$H1" flush 2>&1) || rc=$?
+check "flush 0" [ "$rc" = 0 ]
+check "  └ 검증 한 번" [ "$(verify_runs)" = $((runs + 1)) ]
+check "  └ 두 레인 main에" mainhas p1.txt p2.txt
+check "  └ 레인마다 커밋 하나(2)" [ "$(git -C "$GR" rev-list --count "$GB..origin/main")" = 2 ]
+check "  └ rebase 머지 + --match-head-commit" has "$(cat "$GS/calls")" "--rebase --match-head-commit"
+check "  └ 표식 비움" [ "$(rdy)" = 0 ]
+check "  └ 원격 레인 브랜치·묶음 브랜치 지움" bash -c "[ -z \"\$(git --git-dir='$G' for-each-ref refs/heads/wt/)\" ]"
+check "  └ 번호표 비움" qempty
+check "  └ 워크트리는 그대로(다른 기계 것은 건드리지 않음)" bash -c "[ -d '$P1' ] && [ -d '$P2' ]"
+check "  └ 메인 폴더 fast-forward" [ -f "$GR/p2.txt" ]
+rc=0; out=$(wtg "$P1" "$H1" finish 2>&1) || rc=$?
+check "주인 기계의 finish는 '이미 반영됨'으로 정리만" bash -c "[ $rc = 0 ] && [ ! -e '$P1' ]"
+check "  └ 안내" has "$out" "이미 main에 반영된 레인입니다"
+git -C "$GR2" fetch -q origin
+check "다른 기계 list는 [main에 반영됨]" has "$(cd "$GR2" && WT_NO_READY=1 "$WT" list 2>&1)" "wt/p2  +1 [main에 반영됨]"
+wtg "$P2" m2 finish >/dev/null 2>&1 || true
+check "  └ 그 기계의 finish로 정리" [ ! -e "$P2" ]
+Z1=$(gstart z1); echo z >"$Z1/z1.txt"; commit "$Z1" "z1"; wtg "$Z1" "$H1" ready >/dev/null 2>&1
+runs=$(verify_runs); rc=0; out=$(wtg "$GR" "$H1" flush 2>&1) || rc=$?
+check "레인 하나·기준 그대로면 이미 검증한 트리라 검증 건너뜀" bash -c "[ $rc = 0 ] && [ $(verify_runs) = $runs ]"
+check "  └ 안내" has "$out" "이미 검증한 트리와 같아 검증을 건너뜁니다"
+wtg "$Z1" "$H1" finish >/dev/null 2>&1 || true
+rc=0; out=$(wtg "$GR" "$H1" flush 2>&1) || rc=$?
+check "준비된 레인이 없으면 flush 0 + 안내(번호표 없이)" bash -c "[ $rc = 0 ] && printf '%s' \"\$1\" | grep -F '준비된 레인이 없습니다' >/dev/null" _ "$out"
+
+scene "⑭-2 묶음에서 충돌하는 레인은 빼고 나머지만 머지, 그 표식에 충돌·기준을 남김"
+C1=$(gstart c1); sed -i.bak '3s/.*/C1/' "$C1/a.txt"; rm "$C1/a.txt.bak"; commit "$C1" "c1: 3번 줄"
+C2=$(gs2 c2); sed -i.bak '3s/.*/C2/' "$C2/a.txt"; rm "$C2/a.txt.bak"; commit "$C2" "c2: 같은 줄"
+wtg "$C1" "$H1" ready >/dev/null 2>&1; wtg "$C2" m2 ready >/dev/null 2>&1
+git -C "$GR" fetch -q origin; GB=$(git -C "$GR" rev-parse origin/main)
+rc=0; out=$(wtg "$GR" "$H1" flush 2>&1) || rc=$?
+check "충돌로 뺀 레인이 있으면 flush 3" [ "$rc" = 3 ]
+check "  └ c1만 main에" bash -c "git -C '$GR' fetch -q origin && [ \"\$(git -C '$GR' show origin/main:a.txt | sed -n 3p)\" = C1 ]"
+check "  └ 안내" has "$out" "충돌로 뺌: wt/c2"
+check "  └ c2 표식: state=conflict + 그때 기준" has "$(rsubj refs/wt-ready/main/c2)" "state=conflict against=$GB note="
+check "  └ c1 표식은 지움" [ "$(rdy)" = 1 ]
+check "  └ wt queue에 [충돌로 빠짐]" has "$(wq 2>&1)" "  main/c2  m2  0분 전 [충돌로 빠짐, 기준 ${GB:0:9}"
+check "충돌 표식은 다음 flush가 쌓지 않음" has "$(wtg "$GR" "$H1" flush 2>&1)" "준비된 레인이 없습니다"
+rc=0; out=$(wtg "$C2" m2 finish 2>&1) || rc=$?
+check "주인의 finish는 rebase 충돌로 멈춤(지금처럼)" has "$out" "rebase 충돌"
+(cd "$C2" && git rebase --abort)
+wtg "$C2" m2 ready --cancel >/dev/null 2>&1
+check "ready --cancel이 표식 지움" [ "$(rdy)" = 0 ]
+wtg "$C1" "$H1" finish >/dev/null 2>&1 || true
+
+scene "⑭-3 묶음 검증이 실패하면 아무것도 머지하지 않고 표식에 실패를 남김"
+V1=$(gstart vf1); echo v1 >"$V1/vf1.txt"; commit "$V1" "vf1"
+V2=$(gs2 vf2); echo v2 >"$V2/vf2.txt"; commit "$V2" "vf2"
+wtg "$V1" "$H1" ready >/dev/null 2>&1; wtg "$V2" m2 ready >/dev/null 2>&1
+git -C "$GR" fetch -q origin; GB=$(git -C "$GR" rev-parse origin/main)
+rc=0; out=$(export VERIFY_HOOK="exit 1"; wtg "$GR" "$H1" flush 2>&1) || rc=$?
+check "검증 실패면 flush 1" [ "$rc" = 1 ]
+check "  └ 안내" has "$out" "묶음 검증 실패. 아무것도 머지하지 않았습니다"
+check "  └ main 그대로" bash -c "git -C '$GR' fetch -q origin && [ \"\$(git -C '$GR' rev-parse origin/main)\" = '$GB' ]"
+check "  └ 두 표식 state=failed" bash -c "printf '%s\n%s\n' \"\$1\" \"\$2\" | grep -c 'state=failed against=$GB' | grep -x 2 >/dev/null" _ "$(rsubj refs/wt-ready/main/vf1)" "$(rsubj refs/wt-ready/main/vf2)"
+check "  └ wt queue에 [묶음 검증 실패]" has "$(wq 2>&1)" "[묶음 검증 실패, 기준 ${GB:0:9}"
+check "  └ 번호표·통합 워크트리 정리" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ] && ! git -C '$GR' worktree list | grep -F .train- >/dev/null"
+
+scene "⑭-4 finish가 차례를 받으면 다른 준비됨 레인을 함께 묶어 검증 한 번"
+runs=$(verify_runs)
+wtg "$V1" "$H1" ready >/dev/null 2>&1; wtg "$V2" m2 ready >/dev/null 2>&1
+check "다시 ready: 같은 트리라 검증 없이 state=ready로" bash -c "[ $(verify_runs) = $runs ] && printf '%s' \"\$1\" | grep -F 'state=ready note=' >/dev/null" _ "$(rsubj refs/wt-ready/main/vf2)"
+A3=$(gstart a3); echo a3 >"$A3/a3.txt"; commit "$A3" "a3"
+git -C "$GR" fetch -q origin; GB=$(git -C "$GR" rev-parse origin/main)
+rc=0; out=$(wtg "$A3" "$H1" finish 2>&1) || rc=$?
+check "finish 0" [ "$rc" = 0 ]
+check "  └ 검증 2회(이 레인 + 묶음)" [ "$(verify_runs)" = $((runs + 2)) ]
+check "  └ 묶음 안내(내 레인 먼저)" has "$out" "묶음 머지 → a3 vf1 vf2"
+check "  └ 세 레인 main에, 레인마다 커밋 하나" bash -c "git -C '$GR' fetch -q origin && for f in a3 vf1 vf2; do git -C '$GR' cat-file -e origin/main:\$f.txt || exit 1; done && [ \"\$(git -C '$GR' rev-list --count '$GB..origin/main')\" = 3 ]"
+check "  └ 표식·번호표 비움" bash -c "[ $(rdy) = 0 ] && [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
+check "  └ 내 레인 정리, 다른 레인 워크트리는 그대로" bash -c "[ ! -e '$A3' ] && [ -d '$V1' ] && [ -d '$V2' ]"
+wtg "$V1" "$H1" finish >/dev/null 2>&1 || true; wtg "$V2" m2 finish >/dev/null 2>&1 || true
+check "  └ 다른 레인은 그 주인 finish가 정리" bash -c "[ ! -e '$V1' ] && [ ! -e '$V2' ]"
+
+scene "⑭-5 줄 서서 기다리던 finish는 앞 차례가 함께 머지한 것을 알아차리고 정리만 하고 0"
+REL=$(WT_HOST=builder wq enter release --pid $$ 2>/dev/null)
+W1=$(gstart w1x); echo w1 >"$W1/w1x.txt"; commit "$W1" "w1x"
+W2=$(gs2 w2x); echo w2 >"$W2/w2x.txt"; commit "$W2" "w2x"
+wtg "$W1" "$H1" finish >"$T/w1.out" 2>&1 & PW1=$!
+untilf "$T/w1.out" "머지 순번"
+wtg "$W2" m2 finish >"$T/w2.out" 2>&1 & PW2=$!
+untilf "$T/w2.out" "머지 순번"
+check "기다리는 두 finish가 준비됨으로 올림" [ "$(rdy)" = 2 ]
+runs=$(verify_runs)
+wql "$REL"
+rc1=0; wait "$PW1" || rc1=$?; rc2=0; wait "$PW2" || rc2=$?
+check "두 finish 모두 0" bash -c "[ $rc1 = 0 ] && [ $rc2 = 0 ]"
+check "  └ 검증은 묶음 한 번" [ "$(verify_runs)" = $((runs + 1)) ]
+check "  └ 기다리던 쪽 안내" has "$(cat "$T/w2.out")" "다른 곳의 묶음 머지에 함께 들어갔습니다"
+check "  └ 둘 다 main에, 워크트리 정리" bash -c "git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:w1x.txt && git -C '$GR' cat-file -e origin/main:w2x.txt && [ ! -e '$W1' ] && [ ! -e '$W2' ]"
+check "  └ 표식·번호표 비움" bash -c "[ $(rdy) = 0 ] && [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
+
+scene "⑭-6 두 기계가 동시에 flush해도 한 번만 머지"
+X1=$(gstart x1); echo x1 >"$X1/x1.txt"; commit "$X1" "x1"
+X2=$(gs2 x2); echo x2 >"$X2/x2.txt"; commit "$X2" "x2"
+wtg "$X1" "$H1" ready >/dev/null 2>&1; wtg "$X2" m2 ready >/dev/null 2>&1
+git -C "$GR" fetch -q origin; GB=$(git -C "$GR" rev-parse origin/main); runs=$(verify_runs)
+wtg "$GR" "$H1" flush >"$T/fa.out" 2>&1 & PFA=$!
+wtg "$GR2" m2 flush >"$T/fb.out" 2>&1 & PFB=$!
+rca=0; wait "$PFA" || rca=$?; rcb=0; wait "$PFB" || rcb=$?
+check "둘 다 0" bash -c "[ $rca = 0 ] && [ $rcb = 0 ]"
+check "  └ 검증 한 번, 레인마다 커밋 하나(2)" bash -c "[ $(verify_runs) = $((runs + 1)) ] && git -C '$GR' fetch -q origin && [ \"\$(git -C '$GR' rev-list --count '$GB..origin/main')\" = 2 ]"
+check "  └ 나중 쪽은 '준비된 레인이 없습니다'" bash -c "cat '$T/fa.out' '$T/fb.out' | grep -F '준비된 레인이 없습니다' >/dev/null"
+check "  └ 표식·번호표 비움" bash -c "[ $(rdy) = 0 ] && [ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ]"
+wtg "$X1" "$H1" finish >/dev/null 2>&1 || true; wtg "$X2" m2 finish >/dev/null 2>&1 || true
+
+scene "⑭-7 wt.autobatch false·--priority critical이면 묶지 않음"
+Y1=$(gs2 y1); echo y1 >"$Y1/y1.txt"; commit "$Y1" "y1"; wtg "$Y1" m2 ready >/dev/null 2>&1
+git -C "$GR" config wt.autobatch false
+Y2=$(gstart y2); echo y2 >"$Y2/y2.txt"; commit "$Y2" "y2"
+rc=0; out=$(wtg "$Y2" "$H1" finish 2>&1) || rc=$?
+git -C "$GR" config --unset wt.autobatch
+check "autobatch false: 이 레인만 머지" bash -c "[ $rc = 0 ] && git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:y2.txt"
+check "  └ 준비됨 레인은 그대로" bash -c "[ $(rdy) = 1 ]"
+check "  └ y1은 main에 없음" mainlacks y1.txt
+Y3=$(gstart y3); echo y3 >"$Y3/y3.txt"; commit "$Y3" "y3"
+rc=0; out=$(wtg "$Y3" "$H1" finish --priority critical 2>&1) || rc=$?
+check "critical: 이 레인만 머지" bash -c "[ $rc = 0 ] && git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:y3.txt"
+check "  └ y1은 여전히 준비됨" bash -c "[ $(rdy) = 1 ]"
+check "  └ y1은 main에 없음" mainlacks y1.txt
+check "남은 준비됨은 flush로" bash -c "cd '$GR' && WT_HOST='$H1' PATH='$T/bin:$PATH' '$WT' flush >/dev/null 2>&1 && git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:y1.txt"
+wtg "$Y1" m2 finish >/dev/null 2>&1 || true
+
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
 bad=[f"{p}:{i}" for p in sys.argv[1:] for i,l in enumerate(open(p,encoding="utf-8"),1) if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[\uac00-\ud7a3]",l)]
