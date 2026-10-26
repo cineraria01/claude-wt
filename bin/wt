@@ -762,7 +762,7 @@ tmp_drop() { teardown_worktree "$WT_TMP_WT"; git worktree remove --force "$WT_TM
 # 기준이 움직였으면 거절된다). 기준이 움직였으면 다시 쌓는다(5번까지). 머지한 표식·원격 레인 브랜치(머지한 커밋 그대로일 때)는
 # 지우고, 뺀 표식은 state=conflict로 남긴다. 다른 기계의 워크트리는 건드리지 않는다. B_NAMES에 머지한 레인 이름.
 # 종료 코드: 0 머지, 3 머지했고 충돌로 뺀 레인 있음, 10 쌓을 다른 레인 없음, 11 내 레인을 쌓지 못함(새 기준과 충돌),
-# 12 검증 실패(아무것도 머지 안 함, 쌓은 다른 표식은 state=failed). 그 밖의 실패는 die.
+# 12 검증 실패(아무것도 머지 안 함, 쌓은 다른 표식은 state=failed), 13 묶음 PR 머지가 막힘(아무것도 머지 안 함). 그 밖의 실패는 die.
 batch_run() {
   local base=$1 title=$2 mine=${3-} mytip=${4-} up="origin/$1" qb root try=0 rows sl sha tip ct subj rc i n
   local refs=() shas=() tips=() names=() vts stacked already conflicted tree head upsha tb pr state body cur
@@ -827,7 +827,8 @@ batch_run() {
         say "PR #$pr rebase 머지(레인마다 커밋 하나)"
         if ! gh pr merge "$pr" --rebase --match-head-commit "$head"; then
           gh pr close "$pr" --delete-branch >/dev/null 2>&1 || true
-          die "머지 실패(rebase 머지 허용 여부·보호 규칙·체크 등). PR #$pr 은 닫았습니다. 아무것도 머지하지 않았습니다"
+          say "묶음 PR #$pr 머지가 막혀(rebase 머지 허용 여부·보호 규칙·체크 등) 닫았습니다. 아무것도 머지하지 않았습니다"
+          tmp_drop; return 13
         fi
         state=$(gh pr view "$pr" --json state --jq .state)
         [ "$state" = MERGED ] || die "PR #$pr 상태가 $state 입니다"
@@ -920,6 +921,7 @@ cmd_flush() {
     0|3) ;;
     10) say "${base}에 준비된 레인이 없습니다(다른 곳이 먼저 머지함)"; return 0 ;;
     12) die "묶음 검증 실패. 아무것도 머지하지 않았습니다. 쌓은 레인의 표식에 실패를 남겼습니다(주인이 그 워크트리에서 wt finish로 각자 검증·머지)" ;;
+    13) die "묶음 머지 실패. 레인 표식은 그대로입니다 — rebase 머지를 허용하거나 레인마다 wt finish" ;;
     *) die "묶음 머지 실패(종료 코드 $rc)" ;;
   esac
   q_leave
@@ -1258,6 +1260,7 @@ cmd_finish() {
                [ $brc = 0 ] || say "충돌로 뺀 레인은 표식에 남겼습니다(wt queue 로 확인, 주인이 그 워크트리에서 wt finish)" ;;
           11) say "새 기준 위에 이 레인을 쌓지 못해 묶지 않고 이 레인만 올립니다" ;;
           12) say "묶음 검증이 실패했습니다(함께 쌓은 레인 표식에 기록). 이 레인만 머지합니다" ;;
+          13) say "묶음 머지가 막혀 이 레인만 squash 머지합니다" ;;
         esac
       fi
     fi

@@ -319,6 +319,7 @@ case "$1 $2" in
   "pr list") [ -f "$GH_STATE/pr" ] && [ ! -f "$GH_STATE/merged" ] && echo 7 || true ;;
   "pr merge") [ -z "${GH_FAIL_MERGE-}" ] || exit 1
               shift 3; m="" want="" subj=squash; while [ $# -gt 0 ]; do case $1 in --rebase|--squash) m=$1; shift ;; --match-head-commit) want=$2; shift 2 ;; --subject) subj=$2; shift 2 ;; *) shift ;; esac; done
+              [ -z "${GH_FAIL_REBASE-}" ] || [ "$m" != --rebase ] || exit 1   # rebase 머지를 허용하지 않는 저장소 흉내
               read -r b h <"$GH_STATE/pr"; c=$(mktemp -d); git clone -q "$GH_ORIGIN" "$c"
               # GitHub처럼: 헤드가 --match-head-commit과 다르면 거절. 기준이 움직였어도 같은 줄 충돌만 없으면 머지한다.
               [ -z "$want" ] || [ "$(git -C "$c" rev-parse "origin/$h")" = "$want" ] || { rm -rf "$c"; exit 1; }
@@ -327,7 +328,7 @@ case "$1 $2" in
                 --squash) (cd "$c" && git checkout -q "$b" && git merge -q --squash "origin/$h" && git commit -qm "$subj" && git push -q origin "HEAD:$b") ;;
                 *) exit 1 ;;
               esac; rm -rf "$c"; touch "$GH_STATE/merged" ;;
-  "pr close") read -r b h <"$GH_STATE/pr"; git --git-dir="$GH_ORIGIN" branch -D "$h" >/dev/null ;;
+  "pr close") read -r b h <"$GH_STATE/pr"; git --git-dir="$GH_ORIGIN" branch -D "$h" >/dev/null; rm -f "$GH_STATE/pr" ;;   # 닫힌 PR은 pr list(open)에 안 나옴
   "pr view") echo MERGED ;;
 esac
 GH
@@ -995,6 +996,19 @@ check "  └ y1은 여전히 준비됨" bash -c "[ $(rdy) = 1 ]"
 check "  └ y1은 main에 없음" mainlacks y1.txt
 check "남은 준비됨은 flush로" bash -c "cd '$GR' && WT_HOST='$H1' PATH='$T/bin:$PATH' '$WT' flush >/dev/null 2>&1 && git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:y1.txt"
 wtg "$Y1" m2 finish >/dev/null 2>&1 || true
+
+scene "⑭-8 rebase 머지가 막힌 저장소: 자동 묶음 finish는 이 레인만 squash 머지, flush는 아무것도 머지 안 함"
+Q1=$(gs2 q1); echo q1 >"$Q1/q1.txt"; commit "$Q1" "q1"; wtg "$Q1" m2 ready >/dev/null 2>&1
+Q2=$(gstart q2); echo q2 >"$Q2/q2.txt"; commit "$Q2" "q2"
+rc=0; out=$(export GH_FAIL_REBASE=1; wtg "$Q2" "$H1" finish 2>&1) || rc=$?
+check "finish 0 + 이 레인만 머지" bash -c "[ $rc = 0 ] && git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:q2.txt"
+check "  └ 안내" has "$out" "묶음 머지가 막혀 이 레인만 squash 머지합니다"
+check "  └ q1은 main에 없고 여전히 준비됨" bash -c "! git -C '$GR' cat-file -e origin/main:q1.txt 2>/dev/null && [ $(rdy) = 1 ]"
+rc=0; out=$(export GH_FAIL_REBASE=1; wtg "$GR" "$H1" flush 2>&1) || rc=$?
+check "flush는 1 + 표식 그대로" bash -c "[ $rc = 1 ] && [ $(rdy) = 1 ]"
+check "  └ 번호표·묶음 브랜치 정리" bash -c "[ -z \"\$(git ls-remote '$G' 'refs/wt-queue/*')\" ] && [ -z \"\$(git --git-dir='$G' for-each-ref refs/heads/wt/batch-)\" ]"
+wtg "$GR" "$H1" flush >/dev/null 2>&1 || true; wtg "$Q1" m2 finish >/dev/null 2>&1 || true
+check "  └ 막힘이 풀린 뒤 flush로 머지·정리" bash -c "git -C '$GR' fetch -q origin && git -C '$GR' cat-file -e origin/main:q1.txt && [ ! -e '$Q1' ] && [ $(rdy) = 0 ]"
 
 ROOT="$(cd "$(dirname "$WT")/.." && pwd)"
 check "변수 바로 뒤에 한글이 붙은 곳 없음" python3 -I -c 'import re,sys
